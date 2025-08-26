@@ -16,6 +16,15 @@ interface TranslationDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMessages(messages: List<TranslationMessage>)
     
+    @Update
+    suspend fun updateMessage(message: TranslationMessage)
+    
+    @Query("SELECT * FROM translation_messages WHERE isActive = 1 LIMIT 1")
+    suspend fun getActiveMessage(): TranslationMessage?
+    
+    @Query("UPDATE translation_messages SET isActive = 0 WHERE id = :messageId")
+    suspend fun setMessageInactive(messageId: String)
+    
     @Query("DELETE FROM translation_messages WHERE id = :messageId")
     suspend fun deleteMessage(messageId: String)
     

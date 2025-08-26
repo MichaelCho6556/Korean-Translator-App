@@ -56,8 +56,14 @@ object AppModule {
         return KoreanTextValidator()
     }
     
-    // NOTE: Removed TFLiteModelManager, NLPCache, and KoreanNLPEnhancementService
-    // These are no longer needed with the simplified pipeline that trusts Soniox output
+    // KoreanNLPService is needed to fix speech recognition spacing issues
+    @Provides
+    @Singleton
+    fun provideKoreanNLPService(
+        @ApplicationContext context: Context
+    ): com.koreantranslator.nlp.KoreanNLPService {
+        return com.koreantranslator.nlp.KoreanNLPService(context)
+    }
     
     @Provides
     @Singleton
@@ -132,6 +138,7 @@ object AppModule {
     fun provideTranslationManager(
         geminiTranslator: GeminiTranslatorImpl,
         mlKitTranslator: MLKitTranslatorImpl,
+        koreanNLPService: com.koreantranslator.nlp.KoreanNLPService,
         networkStateMonitor: NetworkStateMonitor,
         translationCacheManager: TranslationCacheManager,
         circuitBreakerService: CircuitBreakerService,
@@ -140,6 +147,7 @@ object AppModule {
         return TranslationManager(
             geminiTranslator,
             mlKitTranslator,
+            koreanNLPService,
             networkStateMonitor,
             translationCacheManager,
             circuitBreakerService,
@@ -203,6 +211,20 @@ object AppModule {
         @ApplicationContext context: Context
     ): TranslationCacheManager {
         return TranslationCacheManager(context)
+    }
+    
+    @Provides
+    @Singleton
+    fun provideAudioQualityAnalyzer(): AudioQualityAnalyzer {
+        return AudioQualityAnalyzer()
+    }
+    
+    @Provides
+    @Singleton
+    fun provideGeminiReconstructionService(
+        geminiApiService: GeminiApiService
+    ): GeminiReconstructionService {
+        return GeminiReconstructionService(geminiApiService)
     }
     
 }
