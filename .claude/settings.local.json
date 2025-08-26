@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__zen__chat",
+      "Bash(cmd.exe:*)",
+      "Bash(./gradlew:*)",
+      "Bash(gradle:*)",
+      "WebSearch",
+      "Bash(bash ./gradlew assembleDebug --no-daemon)",
+      "mcp__zen__thinkdeep",
+      "Bash(.gradlew clean assembleDebug)",
+      "Bash(powershell.exe:*)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "zen",
+    "context7",
+    "playwright"
+  ],
+  "outputStyle": "Explanatory"
+}
