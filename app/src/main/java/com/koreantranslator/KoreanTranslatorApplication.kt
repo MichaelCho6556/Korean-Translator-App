@@ -238,7 +238,7 @@ class KoreanTranslatorApplication : Application() {
     private fun performAggressiveMemoryCleanup() {
         try {
             // Clear all translation caches
-            translationCacheManager.clearAll()
+            runBlocking { translationCacheManager.clear() }
             
             // Release audio resources if not actively recording
             sonioxStreamingService.cleanup()
@@ -258,7 +258,7 @@ class KoreanTranslatorApplication : Application() {
     private fun performLightMemoryCleanup() {
         try {
             // Clear only expired cache entries
-            translationCacheManager.clearExpired()
+            runBlocking { translationCacheManager.clearExpired() }
             
             Log.i("KoreanTranslatorApp", "Light memory cleanup completed")
         } catch (e: Exception) {
