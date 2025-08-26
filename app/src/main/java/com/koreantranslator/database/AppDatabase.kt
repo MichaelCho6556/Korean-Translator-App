@@ -6,7 +6,7 @@ import java.util.*
 
 @Database(
     entities = [TranslationMessage::class],
-    version = 3,  // Incremented version for database indexes
+    version = 4,  // Incremented version for isActive field addition
     exportSchema = false
 )
 @TypeConverters(Converters::class)
