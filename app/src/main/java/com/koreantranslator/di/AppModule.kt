@@ -6,6 +6,7 @@ import com.koreantranslator.database.AppDatabase
 import com.koreantranslator.database.TranslationDao
 import com.koreantranslator.repository.TranslationRepository
 import com.koreantranslator.service.*
+import com.koreantranslator.nlp.KoreanNLPService
 import com.koreantranslator.util.KoreanTextValidator
 import com.koreantranslator.util.MLKitModelManager
 import dagger.Module
@@ -73,9 +74,10 @@ object AppModule {
         audioQualityAnalyzer: AudioQualityAnalyzer,
         confidenceAwareCorrector: ConfidenceAwareCorrector,
         smartPhraseCache: SmartPhraseCache,
-        geminiReconstructionService: GeminiReconstructionService
+        geminiReconstructionService: GeminiReconstructionService,
+        koreanNLPService: KoreanNLPService
     ): SonioxStreamingService {
-        return SonioxStreamingService(context, koreanTextValidator, audioQualityAnalyzer, confidenceAwareCorrector, smartPhraseCache, geminiReconstructionService)
+        return SonioxStreamingService(context, koreanTextValidator, audioQualityAnalyzer, confidenceAwareCorrector, smartPhraseCache, geminiReconstructionService, koreanNLPService)
     }
     
     @Provides

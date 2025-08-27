@@ -92,8 +92,11 @@ class KoreanNLPService @Inject constructor(
         
         val startTime = System.currentTimeMillis()
         
+        // Step 0: Fix speech recognition spacing issues (syllable separation)
+        val spacingFixed = fixSpeechRecognitionSpacing(text)
+        
         // Step 1: Segment the text using cost-based algorithm
-        val segmented = segment(text)
+        val segmented = segment(spacingFixed)
         
         // Step 2: Add punctuation
         val punctuated = addPunctuation(segmented)
@@ -102,6 +105,168 @@ class KoreanNLPService @Inject constructor(
         Log.d(TAG, "Processed in ${processingTime}ms: ${text.take(30)}... -> ${punctuated.take(30)}...")
         
         punctuated
+    }
+    
+    /**
+     * CRITICAL FIX: Fix Korean speech recognition spacing issues
+     * Speech recognition often produces syllable-separated Korean like "오 늘 날 씨 가"
+     * This needs to be corrected to proper Korean words like "오늘 날씨가"
+     */
+    suspend fun fixSpeechRecognitionSpacing(text: String): String = withContext(Dispatchers.Default) {
+        if (text.isBlank()) return@withContext text
+        
+        Log.d(TAG, "Fixing spacing for: '$text'")
+        
+        // Check if this looks like syllable-separated Korean
+        if (!needsSpacingFix(text)) {
+            Log.d(TAG, "Text doesn't need spacing fix")
+            return@withContext text
+        }
+        
+        // Check if this is continuous Korean text without spaces
+        if (!text.contains(" ") && text.all { it in '가'..'힣' }) {
+            // Handle continuous Korean text by applying word segmentation directly
+            Log.d(TAG, "Processing continuous Korean text: '$text'")
+            val spacedText = formKoreanWords(text)
+            Log.d(TAG, "Spacing fixed: '$text' -> '$spacedText'")
+            return@withContext spacedText
+        }
+        
+        // Handle space-separated tokens (original logic)
+        val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val result = StringBuilder()
+        var i = 0
+        
+        while (i < tokens.size) {
+            val token = tokens[i]
+            
+            if (isKoreanSyllable(token)) {
+                // Found a Korean syllable, collect consecutive syllables
+                val syllableGroup = StringBuilder(token)
+                var j = i + 1
+                
+                // Collect consecutive Korean syllables
+                while (j < tokens.size && isKoreanSyllable(tokens[j])) {
+                    syllableGroup.append(tokens[j])
+                    j++
+                }
+                
+                // Try to form proper Korean words from syllables
+                val mergedText = formKoreanWords(syllableGroup.toString())
+                result.append(mergedText)
+                
+                i = j // Skip processed syllables
+            } else {
+                // Non-Korean token, add as-is
+                result.append(token)
+                i++
+            }
+            
+            // Add space if not at the end
+            if (i < tokens.size) {
+                result.append(" ")
+            }
+        }
+        
+        val fixed = result.toString().trim()
+        Log.d(TAG, "Spacing fixed: '$text' -> '$fixed'")
+        return@withContext fixed
+    }
+    
+    /**
+     * Check if text needs spacing fix (has syllable-separated Korean or continuous Korean text)
+     */
+    private fun needsSpacingFix(text: String): Boolean {
+        // Check for pattern of single Korean characters separated by spaces
+        val koreanSyllablePattern = Regex("([가-힣])\\s+([가-힣])")
+        if (koreanSyllablePattern.containsMatchIn(text)) {
+            return true
+        }
+        
+        // Check for continuous Korean text without spaces that likely needs spacing
+        // Must be 4+ characters and contain no spaces
+        if (text.length >= 4 && !text.contains(" ") && text.all { it in '가'..'힣' || it.isWhitespace() }) {
+            // Count Korean syllables vs spaces
+            val koreanCount = text.count { it in '가'..'힣' }
+            val spaceCount = text.count { it.isWhitespace() }
+            
+            // If we have 4+ Korean characters with few/no spaces, likely needs spacing
+            return koreanCount >= 4 && spaceCount < koreanCount / 3
+        }
+        
+        return false
+    }
+    
+    /**
+     * Check if a token is a single Korean syllable
+     */
+    private fun isKoreanSyllable(token: String): Boolean {
+        return token.length <= 2 && token.all { it in '가'..'힣' }
+    }
+    
+    /**
+     * Form proper Korean words from a string of syllables
+     * Uses dictionary lookup and morphological analysis
+     */
+    private fun formKoreanWords(syllables: String): String {
+        if (syllables.length <= 2) return syllables
+        
+        Log.d(TAG, "Forming Korean words from syllables: '$syllables'")
+        
+        val result = mutableListOf<String>()
+        var i = 0
+        
+        while (i < syllables.length) {
+            var bestMatch: String? = null
+            var bestLength = 1
+            
+            // Try to find the longest dictionary match starting at position i
+            for (len in minOf(6, syllables.length - i) downTo 1) {
+                val candidate = syllables.substring(i, i + len)
+                
+                if (dictionary.contains(candidate) || isValidKoreanWord(candidate)) {
+                    bestMatch = candidate
+                    bestLength = len
+                    break
+                }
+            }
+            
+            // Use the best match or fall back to single character
+            result.add(bestMatch ?: syllables.substring(i, i + 1))
+            i += bestLength
+        }
+        
+        // Join words with spaces for proper Korean spacing
+        val formed = result.joinToString(" ")
+        Log.d(TAG, "Formed words: '$syllables' -> '$formed'")
+        return formed
+    }
+    
+    /**
+     * Check if a candidate is a valid Korean word
+     */
+    private fun isValidKoreanWord(candidate: String): Boolean {
+        if (candidate.length < 2) return false
+        
+        // Check for common Korean word patterns
+        val commonEndings = setOf("다", "요", "까", "가", "나", "어", "아", "지", "니", "는", "을", "를")
+        if (commonEndings.any { candidate.endsWith(it) }) {
+            return true
+        }
+        
+        // Check for compound word patterns
+        if (candidate.length >= 4) {
+            for (i in 2 until candidate.length - 1) {
+                val first = candidate.substring(0, i)
+                val second = candidate.substring(i)
+                
+                if (dictionary.contains(first) && dictionary.contains(second)) {
+                    return true
+                }
+            }
+        }
+        
+        return false
     }
     
     /**

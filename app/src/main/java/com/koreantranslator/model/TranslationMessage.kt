@@ -25,7 +25,8 @@ data class TranslationMessage(
     val translationEngine: TranslationEngine = TranslationEngine.ML_KIT,
     val conversationId: String? = null,  // Groups messages in same conversation
     val segmentNumber: Int = 0,  // Order within conversation
-    val isPartOfContinuous: Boolean = false  // Marks continuous recording segments
+    val isPartOfContinuous: Boolean = false,  // Marks continuous recording segments
+    val isActive: Boolean = false  // Marks message as currently being updated in real-time
 )
 
 enum class TranslationEngine {
