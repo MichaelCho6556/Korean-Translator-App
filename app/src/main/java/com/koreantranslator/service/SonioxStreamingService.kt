@@ -25,6 +25,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import com.koreantranslator.BuildConfig
 import com.koreantranslator.util.KoreanTextValidator
+import com.koreantranslator.util.SentenceDetectionConstants
 import com.koreantranslator.nlp.KoreanNLPService
 
 /**
@@ -182,6 +183,12 @@ class SonioxStreamingService @Inject constructor(
     // Real-time partial token accumulator for proper Korean spacing
     private val partialTokenAccumulator = mutableListOf<String>()
     
+    // SENTENCE ACCUMULATION: Fix fragmentation by accumulating until sentence completion
+    private val sentenceAccumulator = StringBuilder()
+    private var lastTokenTime = 0L
+    private var sentenceTimeoutJob: Job? = null
+    private var sentenceCompletionInProgress = false // Edge case protection
+    
     // Korean syllable pattern for proper reconstruction
     private val koreanSyllablePattern = Regex("[가-힣]")
     private val fragmentedSyllablePattern = Regex("[가-힣]\\s+[가-힣]")
@@ -235,6 +242,11 @@ class SonioxStreamingService @Inject constructor(
         _systemStatus.value = "Connecting to Soniox..."  // Use system status instead
         _connectionState.value = ConnectionState.CONNECTING
         
+        // SENTENCE ACCUMULATION: Clear sentence state to prevent contamination
+        sentenceAccumulator.clear()
+        sentenceTimeoutJob?.cancel()
+        lastTokenTime = 0L
+        
         // CRITICAL FIX: Clear token state to prevent contamination
         clearTokenState()
         
@@ -272,6 +284,17 @@ class SonioxStreamingService @Inject constructor(
         // Comprehensive buffer cleanup to prevent memory leaks
         audioBuffer.clear()
         Log.d(TAG, "Audio buffer cleared (${audioBuffer.size} remaining)")
+        
+        // SENTENCE ACCUMULATION: Process any remaining accumulated text before stopping
+        if (sentenceAccumulator.isNotEmpty()) {
+            Log.d(TAG, "Processing remaining sentence before stop: '${sentenceAccumulator.toString()}'")
+            processSentenceCompletion(sentenceAccumulator.toString(), forceComplete = true)
+        }
+        
+        // Clear sentence accumulation state
+        sentenceAccumulator.clear()
+        sentenceTimeoutJob?.cancel()
+        lastTokenTime = 0L
         
         // Cancel recording job
         recordingJob?.cancel()
@@ -723,31 +746,54 @@ class SonioxStreamingService @Inject constructor(
                     ?.mapNotNull { it.confidence }
                     ?.average()?.toFloat() ?: 1.0f
                 
-                // Use confidence-aware corrector for intelligent processing
-                val processingResult = confidenceAwareCorrector.processTranscript(directText, avgConfidence)
-                val finalText = processingResult.processedText
-                val finalConfidence = processingResult.finalConfidence
+                // Store confidence for later use
+                _confidence.value = avgConfidence
                 
-                Log.d(TAG, "Confidence-aware processing: ${processingResult.processingLevel}")
-                Log.d(TAG, "Result: '$finalText' (changed: ${processingResult.wasChanged})")
-                
-                Log.d(TAG, "=== TRUST SONIOX APPROACH ===")
+                Log.d(TAG, "=== SENTENCE ACCUMULATION ===")
                 Log.d(TAG, "Final tokens: [${finalTokens.joinToString(", ")}]")
+                Log.d(TAG, "Direct text: '$directText'")
                 Log.d(TAG, "Confidence: ${(avgConfidence * 100).toInt()}%")
-                Log.d(TAG, "Result: '$finalText'")
-                Log.d(TAG, "=============================")
                 
-                // Update UI directly - no complex processing pipeline
-                if (finalText.isNotBlank()) {
-                    _recognizedText.value = finalText
-                    _confidence.value = finalConfidence // Use confidence-aware final confidence
-                    accumulatedSegments.add(finalText)
-                    updateAccumulatedText()
-                    _partialText.value = null
+                // SENTENCE ACCUMULATION: Instead of immediately emitting, accumulate until sentence is complete
+                if (directText.isNotBlank()) {
+                    // SAFETY CHECK: Prevent runaway accumulation
+                    if (sentenceAccumulator.length + directText.length > SentenceDetectionConstants.MAX_SENTENCE_LENGTH) {
+                        Log.w(TAG, "Sentence accumulator exceeding max length (${sentenceAccumulator.length + directText.length}) - forcing completion")
+                        processSentenceCompletion(sentenceAccumulator.toString(), forceComplete = true)
+                    }
                     
-                    // LEARNING: Feed high-confidence transcriptions to SmartPhraseCache
-                    smartPhraseCache.learnFromTranscription(finalText, finalConfidence)
+                    // Add space if we're continuing from previous tokens (unless Korean doesn't need it)
+                    val needsSpace = sentenceAccumulator.isNotEmpty() && 
+                                   !sentenceAccumulator.toString().endsWith(" ") &&
+                                   !directText.startsWith(" ") &&
+                                   koreanTextValidator.containsKorean(sentenceAccumulator.toString()) &&
+                                   koreanTextValidator.containsKorean(directText)
+                    
+                    if (needsSpace) {
+                        sentenceAccumulator.append(" ")
+                    }
+                    sentenceAccumulator.append(directText)
+                    lastTokenTime = System.currentTimeMillis()
+                    
+                    val currentAccumulation = sentenceAccumulator.toString()
+                    Log.d(TAG, "Accumulated: '$currentAccumulation'")
+                    
+                    // Update partial text to show current accumulation
+                    _partialText.value = "$currentAccumulation..."
+                    
+                    // Check if sentence is complete (with edge case protection)
+                    if (isSentenceComplete(currentAccumulation) && !sentenceCompletionInProgress) {
+                        Log.d(TAG, "Sentence boundary detected - processing complete sentence")
+                        sentenceCompletionInProgress = true
+                        processSentenceCompletion(currentAccumulation)
+                        sentenceCompletionInProgress = false
+                    } else if (!sentenceCompletionInProgress) {
+                        Log.d(TAG, "Sentence not complete - starting timeout monitor")
+                        // Start timeout monitor for incomplete sentences
+                        startSentenceTimeoutMonitor()
+                    }
                 }
+                Log.d(TAG, "=============================")
             }
             
             // Handle non-final tokens for real-time display with proper Korean spacing
@@ -1032,6 +1078,100 @@ class SonioxStreamingService @Inject constructor(
         // Add spaces only around punctuation if needed
         return joined.replace(Regex("([.!?])([가-힣])"), "$1 $2")
                      .replace(Regex("([가-힣])([.!?])"), "$1$2")
+    }
+    
+    /**
+     * SENTENCE COMPLETION DETECTION: Check if accumulated text forms a complete sentence
+     * This fixes the fragmentation issue by waiting for proper sentence boundaries
+     */
+    private fun isSentenceComplete(text: String): Boolean {
+        val trimmedText = text.trim()
+        if (trimmedText.isEmpty()) return false
+        
+        // Check for explicit punctuation using shared constants
+        if (SentenceDetectionConstants.KOREAN_PUNCTUATION.any { trimmedText.endsWith(it) }) {
+            Log.d(TAG, "Sentence complete: punctuation detected")
+            return true
+        }
+        
+        // Check for common Korean sentence endings using shared constants
+        if (SentenceDetectionConstants.KOREAN_SENTENCE_ENDINGS.any { trimmedText.endsWith(it) }) {
+            Log.d(TAG, "Sentence complete: Korean ending detected")
+            return true
+        }
+        
+        // Check for timeout (incomplete sentence handling) using shared constants
+        val timeSinceLastToken = System.currentTimeMillis() - lastTokenTime
+        if (timeSinceLastToken > SentenceDetectionConstants.SENTENCE_TIMEOUT_MS && 
+            trimmedText.length > SentenceDetectionConstants.MIN_LENGTH_FOR_TIMEOUT_COMPLETION) {
+            Log.d(TAG, "Sentence complete: timeout after ${timeSinceLastToken}ms")
+            return true
+        }
+        
+        return false
+    }
+    
+    /**
+     * TIMEOUT HANDLER: Start monitoring for sentence completion timeout
+     */
+    private fun startSentenceTimeoutMonitor() {
+        sentenceTimeoutJob?.cancel()
+        sentenceTimeoutJob = coroutineScope.launch {
+            delay(SentenceDetectionConstants.SENTENCE_TIMEOUT_MS)
+            
+            // Check if we have accumulated text that should be processed
+            if (sentenceAccumulator.isNotEmpty() && _isListening.value) {
+                Log.d(TAG, "Sentence timeout - forcing completion of: '${sentenceAccumulator.toString().take(50)}...'")
+                processSentenceCompletion(sentenceAccumulator.toString(), forceComplete = true)
+            }
+        }
+    }
+    
+    /**
+     * SENTENCE COMPLETION PROCESSOR: Handle complete sentences
+     */
+    private fun processSentenceCompletion(completeSentence: String, forceComplete: Boolean = false) {
+        val trimmedSentence = completeSentence.trim()
+        if (trimmedSentence.isEmpty()) return
+        
+        Log.d(TAG, "Processing complete sentence: '$trimmedSentence' (forced: $forceComplete)")
+        
+        // Clear accumulator
+        sentenceAccumulator.clear()
+        sentenceTimeoutJob?.cancel()
+        
+        // Process the complete sentence with confidence-aware corrector
+        coroutineScope.launch {
+            try {
+                val avgConfidence = _confidence.value ?: 1.0f
+                val processingResult = confidenceAwareCorrector.processTranscript(trimmedSentence, avgConfidence)
+                val finalText = processingResult.processedText
+                val finalConfidence = processingResult.finalConfidence
+                
+                Log.d(TAG, "=== SENTENCE COMPLETION ===")
+                Log.d(TAG, "Complete sentence: '$finalText'")
+                Log.d(TAG, "Confidence: ${(finalConfidence * 100).toInt()}%")
+                Log.d(TAG, "Processing: ${processingResult.processingLevel}")
+                Log.d(TAG, "===========================")
+                
+                // Update UI with complete sentence
+                if (finalText.isNotBlank()) {
+                    _recognizedText.value = finalText
+                    _confidence.value = finalConfidence
+                    accumulatedSegments.add(finalText)
+                    updateAccumulatedText()
+                    _partialText.value = null
+                    
+                    // LEARNING: Feed high-confidence transcriptions to SmartPhraseCache
+                    smartPhraseCache.learnFromTranscription(finalText, finalConfidence)
+                }
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing sentence completion", e)
+                // Fallback: emit original text
+                _recognizedText.value = trimmedSentence
+            }
+        }
     }
     
     // NOTE: Advanced token reconstruction removed - trusting Soniox output directly

@@ -42,4 +42,10 @@ interface TranslationDao {
     
     @Query("DELETE FROM translation_messages WHERE timestamp < :cutoffTime")
     suspend fun deleteMessagesOlderThan(cutoffTime: Long): Int
+    
+    @Query("SELECT * FROM translation_messages ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getMostRecentMessage(): TranslationMessage?
+    
+    @Query("UPDATE translation_messages SET isActive = 1 WHERE id = :messageId")
+    suspend fun setMessageActive(messageId: String)
 }
