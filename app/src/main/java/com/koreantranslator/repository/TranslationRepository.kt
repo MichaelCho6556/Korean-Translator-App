@@ -168,6 +168,25 @@ class TranslationRepository @Inject constructor(
         }
     }
 
+    suspend fun getMostRecentMessage(): TranslationMessage? = withContext(Dispatchers.IO) {
+        try {
+            return@withContext translationDao.getMostRecentMessage()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get most recent message: ${e.message}", e)
+            return@withContext null
+        }
+    }
+    
+    suspend fun setMessageActive(messageId: String) = withContext(Dispatchers.IO) {
+        try {
+            translationDao.setMessageActive(messageId)
+            Log.d(TAG, "Set message $messageId as active")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set message active: ${e.message}", e)
+            throw e
+        }
+    }
+
     data class DatabaseStats(
         val totalMessages: Int,
         val estimatedSizeKB: Int
