@@ -71,10 +71,19 @@ object AppModule {
     // KoreanNLPService is needed to fix speech recognition spacing issues
     @Provides
     @Singleton
-    fun provideKoreanNLPService(
+    fun provideKoreanDictionaryLoader(
         @ApplicationContext context: Context
+    ): com.koreantranslator.nlp.KoreanDictionaryLoader {
+        return com.koreantranslator.nlp.KoreanDictionaryLoader(context)
+    }
+
+    @Provides
+    @Singleton
+    fun provideKoreanNLPService(
+        @ApplicationContext context: Context,
+        koreanDictionaryLoader: com.koreantranslator.nlp.KoreanDictionaryLoader
     ): com.koreantranslator.nlp.KoreanNLPService {
-        return com.koreantranslator.nlp.KoreanNLPService(context)
+        return com.koreantranslator.nlp.KoreanNLPService(context, koreanDictionaryLoader)
     }
     
     @Provides
@@ -238,6 +247,14 @@ object AppModule {
         geminiApiService: GeminiApiService
     ): GeminiReconstructionService {
         return GeminiReconstructionService(geminiApiService)
+    }
+    
+    @Provides
+    @Singleton
+    fun provideProductionAlertingService(
+        @ApplicationContext context: Context
+    ): ProductionAlertingService {
+        return ProductionAlertingService(context)
     }
     
 }

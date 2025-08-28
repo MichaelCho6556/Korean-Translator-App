@@ -78,8 +78,8 @@ class SonioxStreamingService @Inject constructor(
     private val _partialText = MutableStateFlow<String?>(null)
     val partialText: StateFlow<String?> = _partialText
     
-    private val _accumulatedText = MutableStateFlow<String?>(null)
-    val accumulatedText: StateFlow<String?> = _accumulatedText
+    // REMOVED: Accumulation infrastructure to prevent double accumulation
+    // Service now only emits individual sentences via _recognizedText
     
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error
@@ -152,8 +152,7 @@ class SonioxStreamingService @Inject constructor(
     
     private val gson = Gson()
     
-    // Accumulated text management
-    private val accumulatedSegments = mutableListOf<String>()
+    // REMOVED: Accumulated text management to prevent duplication
     private var currentTranscript = StringBuilder()
     
     // Audio buffering for connection setup
@@ -235,10 +234,10 @@ class SonioxStreamingService @Inject constructor(
         _isListening.value = true
         _error.value = null
         currentTranscript.clear()
-        accumulatedSegments.clear()
+        // REMOVED: accumulatedSegments.clear()
         _recognizedText.value = null
         _partialText.value = null  // Clear partial text, don't use for system status
-        _accumulatedText.value = null
+        // REMOVED: _accumulatedText.value = null
         _systemStatus.value = "Connecting to Soniox..."  // Use system status instead
         _connectionState.value = ConnectionState.CONNECTING
         
@@ -338,7 +337,7 @@ class SonioxStreamingService @Inject constructor(
         
         // Immediately clear all buffers
         audioBuffer.clear()
-        accumulatedSegments.clear()
+        // REMOVED: accumulatedSegments.clear()
         currentTranscript.clear()
         
         // Force garbage collection hint
@@ -352,13 +351,13 @@ class SonioxStreamingService @Inject constructor(
      */
     fun getMemoryUsage(): MemoryUsageInfo {
         val audioBufferBytes = audioBuffer.sumOf { it.size }
-        val accumulatedTextBytes = accumulatedSegments.sumOf { it.toByteArray().size }
+        // REMOVED: accumulatedTextBytes calculation - no longer tracking segments
         
         return MemoryUsageInfo(
             audioBufferChunks = audioBuffer.size,
             audioBufferBytes = audioBufferBytes,
-            accumulatedTextBytes = accumulatedTextBytes,
-            totalMemoryBytes = audioBufferBytes + accumulatedTextBytes
+            accumulatedTextBytes = 0, // Always 0 since we removed accumulation
+            totalMemoryBytes = audioBufferBytes
         )
     }
     
@@ -705,10 +704,8 @@ class SonioxStreamingService @Inject constructor(
     
     // NOTE: Complex syllable reconstruction removed - Soniox provides proper syllables
     
-    private fun updateAccumulatedText() {
-        val accumulated = accumulatedSegments.joinToString(" ")
-        _accumulatedText.value = accumulated
-    }
+    // REMOVED: updateAccumulatedText() method - no longer needed
+    // Accumulation now handled solely by ViewModel
     
     // NOTE: Token relation and merging logic removed - not needed with direct Soniox processing
 
@@ -920,8 +917,8 @@ class SonioxStreamingService @Inject constructor(
     }
     
     fun clearAccumulatedText() {
-        accumulatedSegments.clear()
-        _accumulatedText.value = null
+        // REMOVED: accumulatedSegments.clear()
+        // REMOVED: _accumulatedText.value = null
         currentTranscript.clear()
         _partialText.value = null
         _recognizedText.value = null
@@ -1006,13 +1003,8 @@ class SonioxStreamingService @Inject constructor(
     private fun performMemoryCleanup() {
         bufferCleanupCount++
         
-        // Clear old accumulated text if we have too much
-        if (accumulatedSegments.size > 10) {
-            val toKeep = accumulatedSegments.takeLast(5)
-            accumulatedSegments.clear()
-            accumulatedSegments.addAll(toKeep)
-            Log.d(TAG, "Trimmed accumulated segments to last 5 (was ${accumulatedSegments.size + 5})")
-        }
+        // REMOVED: Accumulated text cleanup - no longer maintaining segments
+        // Accumulation now handled by ViewModel only
         
         // Clear old audio buffer
         if (audioBuffer.size > 50) {
@@ -1154,12 +1146,13 @@ class SonioxStreamingService @Inject constructor(
                 Log.d(TAG, "Processing: ${processingResult.processingLevel}")
                 Log.d(TAG, "===========================")
                 
-                // Update UI with complete sentence
+                // Update UI with complete sentence - emit individual sentences only
                 if (finalText.isNotBlank()) {
                     _recognizedText.value = finalText
                     _confidence.value = finalConfidence
-                    accumulatedSegments.add(finalText)
-                    updateAccumulatedText()
+                    // REMOVED: Service-layer accumulation to prevent duplication
+                    // accumulatedSegments.add(finalText)
+                    // updateAccumulatedText()
                     _partialText.value = null
                     
                     // LEARNING: Feed high-confidence transcriptions to SmartPhraseCache
