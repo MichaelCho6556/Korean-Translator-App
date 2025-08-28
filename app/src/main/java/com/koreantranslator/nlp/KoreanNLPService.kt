@@ -21,7 +21,8 @@ import javax.inject.Singleton
  */
 @Singleton
 class KoreanNLPService @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val koreanDictionaryLoader: KoreanDictionaryLoader
 ) {
     
     companion object {
@@ -70,6 +71,14 @@ class KoreanNLPService @Inject constructor(
             "그러므로", "또한", "또", "게다가", "그렇지만", "물론",
             "왜냐하면", "만약", "만일", "비록", "아무리"
         )
+        
+        // Protected expressions that should NEVER be split
+        private val PROTECTED_EXPRESSIONS = setOf(
+            "안녕하세요", "감사합니다", "죄송합니다", "고맙습니다",
+            "안녕히가세요", "안녕히계세요", "잘있어요", "잘가요",
+            "반갑습니다", "처음뵙겠습니다", "수고하세요", "안녕하십니까",
+            "실례합니다", "괜찮습니다", "미안합니다", "다행입니다"
+        )
     }
     
     // Main dictionary Trie
@@ -77,11 +86,29 @@ class KoreanNLPService @Inject constructor(
     
     // Compound word patterns
     private val compoundPatterns = mutableSetOf<String>()
+    private var comprehensivePatternsLoaded = false
     
     init {
         // Initialize dictionary and patterns
         initializeDictionary()
         initializeCompoundPatterns()
+        // Additional patterns loaded asynchronously during first use
+    }
+    
+    /**
+     * Load comprehensive patterns from KoreanDictionaryLoader
+     */
+    private suspend fun loadComprehensivePatterns() {
+        if (!comprehensivePatternsLoaded) {
+            try {
+                val additionalPatterns = koreanDictionaryLoader.loadCompoundPatterns()
+                compoundPatterns.addAll(additionalPatterns)
+                comprehensivePatternsLoaded = true
+                Log.d(TAG, "Loaded ${additionalPatterns.size} comprehensive compound patterns")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load comprehensive patterns", e)
+            }
+        }
     }
     
     /**
@@ -89,6 +116,9 @@ class KoreanNLPService @Inject constructor(
      */
     suspend fun process(text: String): String = withContext(Dispatchers.Default) {
         if (text.isBlank()) return@withContext text
+        
+        // Load comprehensive patterns on first use
+        loadComprehensivePatterns()
         
         val startTime = System.currentTimeMillis()
         
@@ -114,6 +144,9 @@ class KoreanNLPService @Inject constructor(
      */
     suspend fun fixSpeechRecognitionSpacing(text: String): String = withContext(Dispatchers.Default) {
         if (text.isBlank()) return@withContext text
+        
+        // Load comprehensive patterns on first use
+        loadComprehensivePatterns()
         
         Log.d(TAG, "Fixing spacing for: '$text'")
         
@@ -212,6 +245,18 @@ class KoreanNLPService @Inject constructor(
         if (syllables.length <= 2) return syllables
         
         Log.d(TAG, "Forming Korean words from syllables: '$syllables'")
+        
+        // FIRST: Check if entire text is a protected expression
+        if (PROTECTED_EXPRESSIONS.contains(syllables)) {
+            Log.d(TAG, "Protected expression detected - not splitting: '$syllables'")
+            return syllables
+        }
+        
+        // SECOND: Check if entire text is a compound word
+        if (compoundPatterns.contains(syllables)) {
+            Log.d(TAG, "Compound word detected - not splitting: '$syllables'")
+            return syllables
+        }
         
         val result = mutableListOf<String>()
         var i = 0
@@ -552,6 +597,7 @@ class KoreanNLPService @Inject constructor(
     private fun initializeCompoundPatterns() {
         compoundPatterns.addAll(setOf(
             "오늘밤", "어제밤", "내일밤",
+            "오늘날씨", "내일날씨", "어제날씨", "주말날씨", "내일기온",
             "이번주", "다음주", "지난주",
             "이번달", "다음달", "지난달",
             "올해", "내년", "작년",
