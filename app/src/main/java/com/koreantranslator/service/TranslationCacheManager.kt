@@ -80,22 +80,11 @@ class TranslationCacheManager @Inject constructor(
         withContext(Dispatchers.IO) {
             Log.d(TAG, "Initializing translation cache...")
             
-            // Pre-populate with common phrases if available
-            commonPhrases.forEach { phrase ->
-                // These would be pre-translated during app initialization
-                // For now, we just mark them as frequent
-                frequentPhraseCache[phrase.lowercase()] = CacheEntry(
-                    response = TranslationResponse(
-                        translatedText = "", // Would be actual translation
-                        confidence = 0.95f,
-                        engine = com.koreantranslator.model.TranslationEngine.ML_KIT,
-                        isEnhanced = false
-                    ),
-                    ttl = FREQUENT_PHRASE_TTL_MS
-                )
-            }
+            // FIXED: Don't pre-populate cache with empty translations
+            // This was causing cache hits that returned empty translation results
+            // Common phrases will be cached naturally as they're translated
             
-            Log.d(TAG, "Cache initialized with ${frequentPhraseCache.size} common phrases")
+            Log.d(TAG, "Translation cache initialized - ready to cache actual translations")
         }
     }
     

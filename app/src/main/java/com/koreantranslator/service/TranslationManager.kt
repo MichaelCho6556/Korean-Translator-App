@@ -89,41 +89,58 @@ class TranslationManager @Inject constructor(
             // Step 1: Check cache first
             Log.d(TAG, "Step 1: Checking cache...")
             getCachedTranslation(normalizedText)?.let { cached ->
-                cacheHits++
-                Log.d(TAG, "✓ CACHE HIT! Found cached translation from ${cached.engine.name}")
-                Log.d(TAG, "Cached result: '${cached.translatedText.take(50)}...' (conf: ${(cached.confidence * 100).toInt()}%)")
-                
-                val cachedState = TranslationState.Success(
-                    originalText = normalizedText,
-                    translatedText = cached.translatedText,
-                    engine = cached.engine,
-                    confidence = cached.confidence,
-                    fromCache = true,
-                    processingTimeMs = 0L
-                )
-                _translationState.value = cachedState
-                emit(cachedState)
-                Log.d(TAG, "═══════════ TRANSLATION COMPLETE (CACHED) ═══════════")
-                return@flow
+                // FIXED: Validate cached translation is not empty
+                if (cached.translatedText.trim().isNotEmpty()) {
+                    cacheHits++
+                    Log.d(TAG, "✓ CACHE HIT! Found cached translation from ${cached.engine.name}")
+                    Log.d(TAG, "Cached result: '${cached.translatedText.take(50)}...' (conf: ${(cached.confidence * 100).toInt()}%)")
+                    
+                    val cachedState = TranslationState.Success(
+                        originalText = normalizedText,
+                        translatedText = cached.translatedText,
+                        engine = cached.engine,
+                        confidence = cached.confidence,
+                        fromCache = true,
+                        processingTimeMs = 0L
+                    )
+                    _translationState.value = cachedState
+                    emit(cachedState)
+                    Log.d(TAG, "═══════════ TRANSLATION COMPLETE (CACHED) ═══════════")
+                    return@flow
+                } else {
+                    Log.d(TAG, "✗ CACHE HIT REJECTED: Cached translation is empty, proceeding with fresh translation")
+                }
             }
             Log.d(TAG, "No cache hit, proceeding with dual-engine translation...")
             
             Log.d(TAG, "Step 2: Starting ML Kit translation...")
+            Log.d(TAG, "ML Kit available: ${mlKitTranslator.isAvailable()}")
             val translatingState = TranslationState.Translating(normalizedText)
             _translationState.value = translatingState
             emit(translatingState)
             
             // Step 2: Get instant ML Kit translation
             val mlKitResult = getMLKitTranslation(normalizedText)
-            if (mlKitResult != null) {
-                Log.d(TAG, "✓ ML Kit translation successful: '${mlKitResult.translatedText.take(50)}...'")
+            
+            // CRITICAL FIX: Validate ML Kit result is not empty - reject empty translations
+            val validMLKitResult = if (mlKitResult != null && mlKitResult.translatedText.trim().isNotEmpty()) {
+                mlKitResult
+            } else {
+                if (mlKitResult != null && mlKitResult.translatedText.trim().isEmpty()) {
+                    Log.w(TAG, "✗ ML Kit returned empty translation - treating as failure to trigger Gemini fallback")
+                }
+                null
+            }
+            
+            if (validMLKitResult != null) {
+                Log.d(TAG, "✓ ML Kit translation successful: '${validMLKitResult.translatedText.take(50)}...'")
                 val mlKitState = TranslationState.Success(
                     originalText = normalizedText,
-                    translatedText = mlKitResult.translatedText,
+                    translatedText = validMLKitResult.translatedText,
                     engine = TranslationEngine.ML_KIT,
-                    confidence = mlKitResult.confidence,
+                    confidence = validMLKitResult.confidence,
                     isPartial = shouldUseGemini(preferredEngine, normalizedText),
-                    processingTimeMs = mlKitResult.processingTimeMs
+                    processingTimeMs = validMLKitResult.processingTimeMs
                 )
                 _translationState.value = mlKitState
                 emit(mlKitState)
@@ -142,25 +159,36 @@ class TranslationManager @Inject constructor(
                 emit(enhancingState)
                 
                 val geminiResult = getGeminiTranslation(normalizedText, useContext)
-                if (geminiResult != null) {
+                
+                // CRITICAL FIX: Validate Gemini result is not empty
+                val validGeminiResult = if (geminiResult != null && geminiResult.translatedText.trim().isNotEmpty()) {
+                    geminiResult
+                } else {
+                    if (geminiResult != null && geminiResult.translatedText.trim().isEmpty()) {
+                        Log.w(TAG, "✗ Gemini returned empty translation - treating as failure")
+                    }
+                    null
+                }
+                
+                if (validGeminiResult != null) {
                     geminiSuccesses++
                     Log.d(TAG, "✓ GEMINI ENHANCEMENT SUCCESSFUL!")
-                    Log.d(TAG, "Enhanced result: '${geminiResult.translatedText.take(50)}...' (conf: ${(geminiResult.confidence * 100).toInt()}%)")
+                    Log.d(TAG, "Enhanced result: '${validGeminiResult.translatedText.take(50)}...' (conf: ${(validGeminiResult.confidence * 100).toInt()}%)")
                     
                     // Cache the premium result
-                    cacheTranslation(normalizedText, geminiResult.translatedText, 
-                                   TranslationEngine.GEMINI_FLASH, geminiResult.confidence)
+                    cacheTranslation(normalizedText, validGeminiResult.translatedText, 
+                                   TranslationEngine.GEMINI_FLASH, validGeminiResult.confidence)
                     
                     // Update conversation history
                     updateConversationHistory(normalizedText)
                     
                     val geminiState = TranslationState.Success(
                         originalText = normalizedText,
-                        translatedText = geminiResult.translatedText,
+                        translatedText = validGeminiResult.translatedText,
                         engine = TranslationEngine.GEMINI_FLASH,
-                        confidence = geminiResult.confidence,
+                        confidence = validGeminiResult.confidence,
                         wasEnhanced = true,
-                        processingTimeMs = geminiResult.processingTimeMs
+                        processingTimeMs = validGeminiResult.processingTimeMs
                     )
                     _translationState.value = geminiState
                     emit(geminiState)
@@ -202,19 +230,14 @@ class TranslationManager @Inject constructor(
     
     /**
      * Get ML Kit translation with timeout and Korean preprocessing
-     * FIXED: Now returns empty TranslationResult instead of null on failure
+     * CRITICAL FIX: Returns null on failure to trigger Gemini fallback (not empty results)
      */
     private suspend fun getMLKitTranslation(text: String): Translator.TranslationResult? {
         return try {
             if (!mlKitTranslator.isAvailable()) {
-                Log.w(TAG, "ML Kit not available - returning empty result for backup")
-                // FIXED: Return empty result instead of null to trigger proper error state
-                return Translator.TranslationResult(
-                    translatedText = "", // Empty but not null
-                    confidence = 0.0f,
-                    processingTimeMs = 0L,
-                    modelVersion = "ML_KIT_UNAVAILABLE"
-                )
+                Log.w(TAG, "ML Kit not available - returning null to trigger Gemini fallback")
+                // CRITICAL FIX: Return null instead of empty result to trigger Gemini fallback
+                return null
             }
             
             // CRITICAL FIX: Preprocess Korean text to fix speech recognition spacing issues
@@ -231,25 +254,15 @@ class TranslationManager @Inject constructor(
                           "(${result.processingTimeMs}ms, conf: ${(result.confidence * 100).toInt()}%)")
                 return result
             } else {
-                Log.w(TAG, "ML Kit translation timed out - returning empty result for backup")
-                // FIXED: Return empty result instead of null to maintain translation flow
-                return Translator.TranslationResult(
-                    translatedText = "", // Empty but not null
-                    confidence = 0.0f,
-                    processingTimeMs = ML_KIT_TIMEOUT_MS,
-                    modelVersion = "ML_KIT_TIMEOUT"
-                )
+                Log.w(TAG, "ML Kit translation timed out - returning null to trigger Gemini fallback")
+                // CRITICAL FIX: Return null instead of empty result to trigger Gemini fallback
+                return null
             }
         } catch (e: Exception) {
-            Log.e(TAG, "ML Kit translation failed - returning empty result for backup", e)
+            Log.e(TAG, "ML Kit translation failed - returning null to trigger Gemini fallback", e)
             mlKitFallbacks++
-            // FIXED: Return empty result instead of null to ensure backup creation
-            return Translator.TranslationResult(
-                translatedText = "", // Empty but not null  
-                confidence = 0.0f,
-                processingTimeMs = 0L,
-                modelVersion = "ML_KIT_ERROR"
-            )
+            // CRITICAL FIX: Return null instead of empty result to trigger Gemini fallback
+            return null
         }
     }
     
@@ -344,6 +357,12 @@ class TranslationManager @Inject constructor(
      */
     private suspend fun cacheTranslation(originalText: String, translatedText: String, 
                                 engine: TranslationEngine, confidence: Float) {
+        // CRITICAL FIX: Never cache empty translations
+        if (translatedText.trim().isEmpty()) {
+            Log.w(TAG, "Refusing to cache empty translation for: '${originalText.take(30)}...'")
+            return
+        }
+        
         val cached = CachedTranslation(
             translatedText = translatedText,
             engine = engine,
@@ -424,6 +443,20 @@ class TranslationManager @Inject constructor(
     fun forceRefresh() {
         clearSession()
         Log.d(TAG, "Translation manager refreshed")
+    }
+    
+    /**
+     * Check if translation is currently in progress
+     */
+    fun isProcessing(): Boolean {
+        return _translationState.value != TranslationState.Idle
+    }
+    
+    /**
+     * Check if there are active translations (for pipeline completion tracking)
+     */
+    fun hasActiveTranslations(): Boolean {
+        return isProcessing()
     }
 }
 
