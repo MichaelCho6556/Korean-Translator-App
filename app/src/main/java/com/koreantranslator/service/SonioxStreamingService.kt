@@ -192,11 +192,23 @@ class SonioxStreamingService @Inject constructor(
     private val koreanSyllablePattern = Regex("[가-힣]")
     private val fragmentedSyllablePattern = Regex("[가-힣]\\s+[가-힣]")
     
+    // DEBOUNCING: Prevent excessive partial text updates
+    private var partialTextDebounceJob: Job? = null
+    private var lastPartialUpdate = 0L
+    private var lastPartialText = ""
+    
+    // PERSISTENCE: Keep partial text visible during pauses
+    private var partialTextClearJob: Job? = null
+    private var lastPartialTextForPersistence = ""
+    
     fun startListening(continuous: Boolean = false) {
         if (_isListening.value) {
             Log.w(TAG, "Already listening")
             return
         }
+        
+        // Cancel any scheduled partial text clearing since user is speaking again
+        cancelPartialTextClearDelay()
         
         isIntentionallyStopping = false
         continuousMode = continuous
@@ -236,9 +248,12 @@ class SonioxStreamingService @Inject constructor(
         currentTranscript.clear()
         // REMOVED: accumulatedSegments.clear()
         _recognizedText.value = null
-        _partialText.value = null  // Clear partial text, don't use for system status
+        // Clear partial text immediately when starting new session (different from pauses)
+        partialTextClearJob?.cancel() // Cancel any pending delayed clear
+        _partialText.value = null  
         // REMOVED: _accumulatedText.value = null
         _systemStatus.value = "Connecting to Soniox..."  // Use system status instead
+        lastPartialText = ""  // Reset debouncing state
         _connectionState.value = ConnectionState.CONNECTING
         
         // SENTENCE ACCUMULATION: Clear sentence state to prevent contamination
@@ -294,6 +309,12 @@ class SonioxStreamingService @Inject constructor(
         sentenceAccumulator.clear()
         sentenceTimeoutJob?.cancel()
         lastTokenTime = 0L
+        
+        // Cancel debouncing job and reset state
+        partialTextDebounceJob?.cancel()
+        partialTextDebounceJob = null
+        lastPartialUpdate = 0L
+        lastPartialText = ""
         
         // Cancel recording job
         recordingJob?.cancel()
@@ -775,8 +796,8 @@ class SonioxStreamingService @Inject constructor(
                     val currentAccumulation = sentenceAccumulator.toString()
                     Log.d(TAG, "Accumulated: '$currentAccumulation'")
                     
-                    // Update partial text to show current accumulation
-                    _partialText.value = "$currentAccumulation..."
+                    // Update partial text with debouncing to prevent UI spam
+                    updatePartialTextWithDebouncing(currentAccumulation)
                     
                     // Check if sentence is complete (with edge case protection)
                     if (isSentenceComplete(currentAccumulation) && !sentenceCompletionInProgress) {
@@ -810,22 +831,10 @@ class SonioxStreamingService @Inject constructor(
                 // Join all accumulated tokens without spaces first
                 val joinedText = partialTokenAccumulator.joinToString("")
                 
-                // Only process if we have Korean content
-                if (koreanTextValidator.containsKorean(joinedText)) {
-                    // Use KoreanNLPService to fix spacing intelligently
-                    coroutineScope.launch {
-                        try {
-                            val properlySpacedText = koreanNLPService.fixSpeechRecognitionSpacing(joinedText)
-                            _partialText.value = "$properlySpacedText..."
-                            Log.d(TAG, "Real-time Korean: '$joinedText' -> '$properlySpacedText'")
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Failed to fix Korean spacing for partial text", e)
-                            // Fallback to original behavior
-                            val interimText = joinKoreanTokensProper(nonFinalTokens)
-                            _partialText.value = "$interimText..."
-                        }
-                    }
-                }
+                // FIXED: For partial text, skip Korean NLP processing to prevent fragmentation
+                // Korean NLP should only process complete sentences, not partial real-time text
+                Log.d(TAG, "Real-time partial (no NLP processing): '$joinedText'")
+                updatePartialTextWithDebouncing(joinedText)
             }
             
             // Log completion
@@ -920,8 +929,13 @@ class SonioxStreamingService @Inject constructor(
         // REMOVED: accumulatedSegments.clear()
         // REMOVED: _accumulatedText.value = null
         currentTranscript.clear()
-        _partialText.value = null
+        
+        // FIXED: Use delayed clearing instead of immediate clearing
+        // This keeps partial text visible during natural speech pauses
+        clearPartialTextWithDelay(3000L) // 3 second delay
+        
         _recognizedText.value = null
+        lastPartialText = ""
     }
     
     fun clearError() {
@@ -1073,27 +1087,37 @@ class SonioxStreamingService @Inject constructor(
     }
     
     /**
-     * SENTENCE COMPLETION DETECTION: Check if accumulated text forms a complete sentence
-     * This fixes the fragmentation issue by waiting for proper sentence boundaries
+     * ENHANCED SENTENCE COMPLETION: Check if text forms complete sentence with conversation context
+     * FIXED: Now waits for speech continuity instead of immediately completing on Korean endings
      */
     private fun isSentenceComplete(text: String): Boolean {
         val trimmedText = text.trim()
         if (trimmedText.isEmpty()) return false
         
-        // Check for explicit punctuation using shared constants
+        // Check for explicit punctuation using shared constants (immediate completion)
         if (SentenceDetectionConstants.KOREAN_PUNCTUATION.any { trimmedText.endsWith(it) }) {
             Log.d(TAG, "Sentence complete: punctuation detected")
             return true
         }
         
-        // Check for common Korean sentence endings using shared constants
-        if (SentenceDetectionConstants.KOREAN_SENTENCE_ENDINGS.any { trimmedText.endsWith(it) }) {
-            Log.d(TAG, "Sentence complete: Korean ending detected")
-            return true
+        val timeSinceLastToken = System.currentTimeMillis() - lastTokenTime
+        
+        // FIXED: Check for Korean endings with speech continuity awareness
+        val hasKoreanEnding = SentenceDetectionConstants.KOREAN_SENTENCE_ENDINGS.any { trimmedText.endsWith(it) }
+        if (hasKoreanEnding) {
+            // CONVERSATION MODE: Wait longer after Korean endings to see if speech continues
+            val continuityDelay = 800L // 800ms delay for speech continuity detection
+            
+            if (timeSinceLastToken > continuityDelay) {
+                Log.d(TAG, "Sentence complete: Korean ending + speech pause (${timeSinceLastToken}ms)")
+                return true
+            } else {
+                Log.d(TAG, "Korean ending detected but waiting for speech continuity (${timeSinceLastToken}ms < ${continuityDelay}ms)")
+                return false
+            }
         }
         
         // Check for timeout (incomplete sentence handling) using shared constants
-        val timeSinceLastToken = System.currentTimeMillis() - lastTokenTime
         if (timeSinceLastToken > SentenceDetectionConstants.SENTENCE_TIMEOUT_MS && 
             trimmedText.length > SentenceDetectionConstants.MIN_LENGTH_FOR_TIMEOUT_COMPLETION) {
             Log.d(TAG, "Sentence complete: timeout after ${timeSinceLastToken}ms")
@@ -1167,7 +1191,94 @@ class SonioxStreamingService @Inject constructor(
         }
     }
     
+    /**
+     * DEBOUNCING: Update partial text with debouncing to prevent UI spam
+     * This fixes the fragmentation issue by batching rapid updates with smart ellipsis handling
+     */
+    private fun updatePartialTextWithDebouncing(text: String) {
+        // Skip very short fragments to reduce noise
+        if (text.length < SentenceDetectionConstants.MIN_PARTIAL_TEXT_LENGTH) {
+            return
+        }
+        
+        // TEXT CHANGE DETECTION: Skip update if no meaningful change
+        if (text == lastPartialText || text.trim().isEmpty()) {
+            return
+        }
+        
+        // FIXED: Don't add ellipsis to partial text - let it display naturally
+        val formattedText = when {
+            text.isEmpty() -> ""
+            text.length > 80 -> "${text.take(80)}..." // Only truncate very long text
+            else -> text // Show partial text as-is without ellipsis
+        }
+        
+        val currentTime = System.currentTimeMillis()
+        
+        // Cancel previous debounce job
+        partialTextDebounceJob?.cancel()
+        
+        // ENHANCED DEBOUNCING: Immediate update for first text or after long gap
+        if (lastPartialUpdate == 0L || currentTime - lastPartialUpdate > SentenceDetectionConstants.PARTIAL_TEXT_DEBOUNCE_MS * 2) {
+            _partialText.value = formattedText
+            lastPartialUpdate = currentTime
+            lastPartialText = text
+            Log.d(TAG, "Immediate partial update: '${text.take(20)}' -> '${formattedText.take(23)}'")
+        } else {
+            // CONSOLIDATE RAPID CHANGES: Debounced update for rapid changes
+            partialTextDebounceJob = coroutineScope.launch {
+                delay(SentenceDetectionConstants.PARTIAL_UPDATE_THROTTLE_MS)
+                if (isActive) {
+                    // Re-format in case text changed during debounce
+                    val finalFormattedText = when {
+                        text.isEmpty() -> ""
+                        text.length > 80 -> "${text.take(80)}..."
+                        else -> text // Show partial text as-is
+                    }
+                    
+                    _partialText.value = finalFormattedText
+                    lastPartialUpdate = System.currentTimeMillis()
+                    lastPartialText = text
+                    Log.d(TAG, "Debounced partial update: '${text.take(20)}' -> '${finalFormattedText.take(23)}'")
+                }
+            }
+        }
+    }
+    
     // NOTE: Advanced token reconstruction removed - trusting Soniox output directly
+    
+    /**
+     * Clear partial text with a delay to allow users to continue speaking during natural pauses
+     */
+    private fun clearPartialTextWithDelay(delayMs: Long = 3000L) {
+        // Cancel any existing clear job
+        partialTextClearJob?.cancel()
+        
+        // Save current partial text for potential restoration
+        lastPartialTextForPersistence = _partialText.value ?: ""
+        
+        if (lastPartialTextForPersistence.isNotEmpty()) {
+            partialTextClearJob = coroutineScope.launch {
+                delay(delayMs)
+                if (isActive && !_isListening.value) {
+                    // Only clear if we're still not recording after the delay
+                    _partialText.value = null
+                    lastPartialTextForPersistence = ""
+                    Log.d(TAG, "Cleared partial text after ${delayMs}ms delay")
+                }
+            }
+            Log.d(TAG, "Scheduled partial text clearing in ${delayMs}ms")
+        }
+    }
+    
+    /**
+     * Cancel delayed clearing (when user starts speaking again)
+     */
+    private fun cancelPartialTextClearDelay() {
+        partialTextClearJob?.cancel()
+        partialTextClearJob = null
+        Log.d(TAG, "Cancelled scheduled partial text clearing")
+    }
     
     // NOTE: Multi-token word boundary detection removed - Soniox handles this better
     
