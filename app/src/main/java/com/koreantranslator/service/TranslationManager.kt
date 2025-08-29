@@ -202,12 +202,19 @@ class TranslationManager @Inject constructor(
     
     /**
      * Get ML Kit translation with timeout and Korean preprocessing
+     * FIXED: Now returns empty TranslationResult instead of null on failure
      */
     private suspend fun getMLKitTranslation(text: String): Translator.TranslationResult? {
         return try {
             if (!mlKitTranslator.isAvailable()) {
-                Log.w(TAG, "ML Kit not available")
-                return null
+                Log.w(TAG, "ML Kit not available - returning empty result for backup")
+                // FIXED: Return empty result instead of null to trigger proper error state
+                return Translator.TranslationResult(
+                    translatedText = "", // Empty but not null
+                    confidence = 0.0f,
+                    processingTimeMs = 0L,
+                    modelVersion = "ML_KIT_UNAVAILABLE"
+                )
             }
             
             // CRITICAL FIX: Preprocess Korean text to fix speech recognition spacing issues
@@ -215,16 +222,34 @@ class TranslationManager @Inject constructor(
             val preprocessedText = preprocessKoreanText(text)
             Log.d(TAG, "Preprocessed text for ML Kit: '$preprocessedText'")
             
-            withTimeoutOrNull(ML_KIT_TIMEOUT_MS) {
+            val result = withTimeoutOrNull(ML_KIT_TIMEOUT_MS) {
                 mlKitTranslator.translate(preprocessedText)
-            }?.also {
-                Log.d(TAG, "ML Kit translation: '${it.translatedText.take(50)}...' " +
-                          "(${it.processingTimeMs}ms, conf: ${(it.confidence * 100).toInt()}%)")
+            }
+            
+            if (result != null) {
+                Log.d(TAG, "ML Kit translation: '${result.translatedText.take(50)}...' " +
+                          "(${result.processingTimeMs}ms, conf: ${(result.confidence * 100).toInt()}%)")
+                return result
+            } else {
+                Log.w(TAG, "ML Kit translation timed out - returning empty result for backup")
+                // FIXED: Return empty result instead of null to maintain translation flow
+                return Translator.TranslationResult(
+                    translatedText = "", // Empty but not null
+                    confidence = 0.0f,
+                    processingTimeMs = ML_KIT_TIMEOUT_MS,
+                    modelVersion = "ML_KIT_TIMEOUT"
+                )
             }
         } catch (e: Exception) {
-            Log.e(TAG, "ML Kit translation failed", e)
+            Log.e(TAG, "ML Kit translation failed - returning empty result for backup", e)
             mlKitFallbacks++
-            null
+            // FIXED: Return empty result instead of null to ensure backup creation
+            return Translator.TranslationResult(
+                translatedText = "", // Empty but not null  
+                confidence = 0.0f,
+                processingTimeMs = 0L,
+                modelVersion = "ML_KIT_ERROR"
+            )
         }
     }
     

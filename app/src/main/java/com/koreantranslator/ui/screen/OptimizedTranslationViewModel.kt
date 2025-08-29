@@ -74,7 +74,7 @@ class OptimizedTranslationViewModel @Inject constructor(
         // Optimized debouncing for cost efficiency
         private const val TRANSLATION_DEBOUNCE_MS = 800L  // Wait 800ms after speech
         private const val MAX_TRANSLATION_ATTEMPTS = 2
-        private const val MIN_MESSAGE_LENGTH = 2  // Minimum characters for message creation
+        private const val MIN_MESSAGE_LENGTH = 1  // Minimum characters for message creation (reduced for Korean)
         
         // Message accumulation settings
         private const val SESSION_TIMEOUT_MS = 30_000L  // 30 seconds to continue accumulating
@@ -206,8 +206,30 @@ class OptimizedTranslationViewModel @Inject constructor(
                 .collect { recognizedText ->
                     Log.d(TAG, "Complete sentence received for translation: '${recognizedText.take(50)}...'")
                     
+                    // CRITICAL BACKUP: Immediately create backup when Korean text is recognized
+                    // This ensures Korean text is never lost, even if translation fails
+                    val koreanTextBackup = TranslationBackup(
+                        koreanText = recognizedText.trim(),
+                        englishText = "", // No translation yet, but Korean is preserved
+                        confidence = 0.0f,
+                        timestamp = System.currentTimeMillis(),
+                        engine = TranslationEngine.ML_KIT,
+                        isComplete = true
+                    )
+                    lastSuccessfulTranslation = koreanTextBackup
+                    Log.d(TAG, "💾 Created immediate Korean backup: '${recognizedText.trim()}'")
+                    
                     // CRITICAL FIX: Always translate just the NEW sentence, accumulation happens in handleSuccessfulTranslation
-                    translationTrigger.emit(recognizedText.trim())
+                    // RACE CONDITION GUARD: Prevent multiple simultaneous translations
+                    accumulationStateLock.withLock {
+                        if (_uiState.value.isTranslating || _uiState.value.isEnhancing) {
+                            Log.d(TAG, "🚨 RACE GUARD: Translation already in progress - queuing request")
+                            // Cancel existing translation to prevent overlap
+                            translationJob?.cancel()
+                            delay(50) // Brief delay to let cancellation complete
+                        }
+                        translationTrigger.emit(recognizedText.trim())
+                    }
                     
                     Log.d(TAG, "Translating NEW sentence only: '${recognizedText.trim()}'")
                     if (_uiState.value.isAccumulatingMessage) {
@@ -223,7 +245,11 @@ class OptimizedTranslationViewModel @Inject constructor(
             sonioxStreamingService.partialText.collect { partialText ->
                 // FIXED: Only update UI state, no database operations for partial text
                 _uiState.update { it.copy(currentPartialText = partialText) }
-                Log.d(TAG, "Real-time partial text (UI only): '${partialText?.take(30)}...'")
+                
+                // OPTIMIZED: Reduced logging spam with filtering
+                if (!partialText.isNullOrEmpty() && partialText.length > 2) {
+                    Log.d(TAG, "Real-time partial text (UI only): '${partialText.take(30)}...'")
+                }
                 
                 // Note: Partial text is now UI-only - database updates only happen 
                 // when complete sentences arrive via the recognized text flow
@@ -240,9 +266,9 @@ class OptimizedTranslationViewModel @Inject constructor(
                     createOrContinueActiveMessage()
                     Log.d(TAG, "Recording started - created or continued active message")
                 } else {
-                    // Finalize active message when recording stops
+                    // Finalize active message when recording stops - but keep UI text visible
                     finalizeActiveMessage()
-                    clearCurrentTranslation()
+                    // DON'T clear UI immediately - let user see accumulated text
                     Log.d(TAG, "Recording stopped - finalized active message")
                 }
             }
@@ -525,11 +551,23 @@ class OptimizedTranslationViewModel @Inject constructor(
                     val timeSinceLastMessage = currentTime - mostRecentMessage.timestamp.time
                     // RACE CONDITION FIX: Check atomic finalization tracking
                     val isMessageBeingFinalized = isMessageFinalizing(mostRecentMessage.id)
-                    val canAccumulate = timeSinceLastMessage < SESSION_TIMEOUT_MS &&
+                    // ENHANCED: Extend accumulation timeout during active recording sessions
+                    val isActivelyRecording = _uiState.value.isRecording
+                    val extendedTimeout = if (isActivelyRecording) {
+                        SESSION_TIMEOUT_MS * 2 // Double timeout during active recording (60 seconds)
+                    } else {
+                        SESSION_TIMEOUT_MS // Normal timeout (30 seconds)
+                    }
+                    
+                    val canAccumulate = timeSinceLastMessage < extendedTimeout &&
                                        mostRecentMessage.originalText.length < MAX_ACCUMULATED_LENGTH &&
                                        mostRecentMessage.conversationId == currentConversationId &&
                                        !mostRecentMessage.isActive &&
                                        !isMessageBeingFinalized
+                                       
+                    if (isActivelyRecording) {
+                        Log.d(TAG, "🎙️ Active recording - using extended accumulation timeout: ${extendedTimeout}ms")
+                    }
                     
                     if (canAccumulate && !isMessageBeingFinalized) {
                         // ATOMIC STATE TRANSITION: Eliminate race condition by making database state authoritative
@@ -730,13 +768,9 @@ class OptimizedTranslationViewModel @Inject constructor(
                 if (messageAge > maxMessageAge) {
                     Log.w(TAG, "Active message is stale (${messageAge / 1000}s old) - finalizing and creating new one")
                     
-                    // Finalize the stale message
-                    if (activeMessage.originalText.trim().length >= MIN_MESSAGE_LENGTH && 
-                        activeMessage.translatedText.isNotBlank()) {
-                        translationRepository.setMessageInactive(activeMessage.id)
-                    } else {
-                        translationRepository.deleteMessage(activeMessage.id)
-                    }
+                    // Always preserve stale messages - never delete user speech
+                    translationRepository.setMessageInactive(activeMessage.id)
+                    Log.d(TAG, "Preserved stale message: Korean='${activeMessage.originalText}', English='${activeMessage.translatedText}'")
                     
                     // Create new active message if still recording
                     if (_uiState.value.isRecording) {
@@ -899,93 +933,74 @@ class OptimizedTranslationViewModel @Inject constructor(
                         // Invalidate cache BEFORE database operations
                         invalidateActiveMessageCache()
                         
-                        // Check if message has meaningful content
+                        // ENHANCED MESSAGE PRESERVATION: Prioritize Korean text preservation
                         if (koreanText.length >= MIN_MESSAGE_LENGTH && englishText.isNotBlank()) {
-                            // Message has content - finalize it
+                            // Message has both Korean and English - finalize it
                             translationRepository.setMessageInactive(activeMessageId)
                             currentSegmentNumber++
-                            Log.d(TAG, "✅ Finalized active message: '$koreanText' -> '$englishText'")
-                        } else {
-                            // FALLBACK RECOVERY: Before deleting, check if UI state has successful translations that failed to persist
-                            Log.w(TAG, "⚠️ Message appears empty - checking UI state for recovery data")
+                            Log.d(TAG, "✅ Finalized complete message: '$koreanText' -> '$englishText'")
+                        } else if (koreanText.length >= MIN_MESSAGE_LENGTH) {
+                            // Korean text exists but no translation - preserve Korean text
+                            Log.d(TAG, "📝 Korean text exists but translation failed - preserving Korean-only message")
                             
-                            var recoveredKorean = koreanText
-                            var recoveredEnglish = englishText
-                            var wasRecovered = false
-                            
-                            // Check UI state for backup translation data
-                            val uiState = _uiState.value
-                            val hasPartialText = uiState.currentPartialText?.isNotBlank() == true
-                            val hasPartialTranslation = uiState.currentPartialTranslation?.isNotBlank() == true
-                            
-                            // Also check emergency backup translation
+                            // FIRST: Try backup recovery with extended window
                             val backupTranslation = lastSuccessfulTranslation
-                            val hasBackupData = backupTranslation != null && 
-                                               backupTranslation.koreanText.trim().isNotEmpty() &&
-                                               backupTranslation.englishText.trim().isNotEmpty() &&
-                                               (System.currentTimeMillis() - backupTranslation.timestamp) < 5000 // Within last 5 seconds
+                            val hasValidBackup = backupTranslation != null && 
+                                                backupTranslation.koreanText.trim().length >= MIN_MESSAGE_LENGTH &&
+                                                backupTranslation.englishText.trim().isNotEmpty() &&
+                                                (System.currentTimeMillis() - backupTranslation.timestamp) < 10000 // Extended to 10 seconds
                             
-                            if (hasPartialText || hasPartialTranslation || hasBackupData) {
-                                Log.d(TAG, "🔄 RECOVERY ATTEMPT: Found data in UI/backup state")
-                                Log.d(TAG, "   UI Korean: '${uiState.currentPartialText}'")
-                                Log.d(TAG, "   UI English: '${uiState.currentPartialTranslation}'")
-                                Log.d(TAG, "   Backup available: $hasBackupData")
-                                if (hasBackupData) {
-                                    Log.d(TAG, "   Backup Korean: '${backupTranslation?.koreanText}'")
-                                    Log.d(TAG, "   Backup English: '${backupTranslation?.englishText}'")
-                                }
-                                
-                                // Priority 1: Use UI state data if available and valid
-                                if (uiState.currentPartialText?.trim()?.isNotEmpty() == true) {
-                                    recoveredKorean = uiState.currentPartialText.trim()
-                                    wasRecovered = true
-                                }
-                                if (uiState.currentPartialTranslation?.trim()?.isNotEmpty() == true) {
-                                    recoveredEnglish = uiState.currentPartialTranslation.trim()
-                                    wasRecovered = true
-                                }
-                                
-                                // Priority 2: Use backup data if UI state is insufficient
-                                if (hasBackupData && (!wasRecovered || recoveredKorean.length < MIN_MESSAGE_LENGTH || recoveredEnglish.isBlank())) {
-                                    recoveredKorean = backupTranslation!!.koreanText.trim()
-                                    recoveredEnglish = backupTranslation.englishText.trim()
-                                    wasRecovered = true
-                                    Log.d(TAG, "🔄 Used backup translation data for recovery")
-                                }
-                                
-                                // If we recovered valid content, save it to the message
-                                if (wasRecovered && 
-                                    recoveredKorean.length >= MIN_MESSAGE_LENGTH && 
-                                    recoveredEnglish.isNotBlank()) {
+                            if (hasValidBackup) {
+                                // Use backup data for recovery
+                                try {
+                                    val recoveredMessage = activeMessage.copy(
+                                        originalText = backupTranslation!!.koreanText.trim(),
+                                        translatedText = backupTranslation.englishText.trim(),
+                                        isActive = false
+                                    )
+                                    translationRepository.updateMessage(recoveredMessage)
+                                    currentSegmentNumber++
                                     
-                                    try {
-                                        // Emergency save of recovered content
-                                        val recoveredMessage = activeMessage.copy(
-                                            originalText = recoveredKorean,
-                                            translatedText = recoveredEnglish,
-                                            isActive = false
-                                        )
-                                        translationRepository.updateMessage(recoveredMessage)
-                                        currentSegmentNumber++
-                                        
-                                        Log.d(TAG, "✅ RECOVERY SUCCESS: Saved recovered content")
-                                        Log.d(TAG, "   Recovered Korean: '$recoveredKorean'")
-                                        Log.d(TAG, "   Recovered English: '$recoveredEnglish'")
-                                        
-                                        // Clear backup after successful recovery to prevent memory leaks
-                                        lastSuccessfulTranslation = null
-                                        
-                                    } catch (recoveryException: Exception) {
-                                        Log.e(TAG, "❌ RECOVERY FAILED: Could not save recovered content", recoveryException)
-                                        wasRecovered = false // Mark as failed
-                                    }
+                                    Log.d(TAG, "✅ RECOVERY: Used recent backup data")
+                                    Log.d(TAG, "   Korean: '${backupTranslation.koreanText}'")
+                                    Log.d(TAG, "   English: '${backupTranslation.englishText}'")
+                                    
+                                    // Clear backup after successful recovery
+                                    lastSuccessfulTranslation = null
+                                    
+                                } catch (recoveryException: Exception) {
+                                    Log.e(TAG, "❌ RECOVERY FAILED: Could not save backup data", recoveryException)
+                                    // Preserve Korean text even if recovery fails
+                                    val koreanOnlyMessage = activeMessage.copy(
+                                        originalText = koreanText,
+                                        translatedText = "[Translation failed - manual retry needed]", 
+                                        confidence = 0.0f,
+                                        isActive = false
+                                    )
+                                    translationRepository.updateMessage(koreanOnlyMessage)
+                                    Log.d(TAG, "💾 Preserved Korean text after recovery failure: '$koreanText'")
                                 }
-                            }
-                            
-                            // Only delete if recovery failed AND message is truly empty
-                            if (!wasRecovered) {
-                                translationRepository.deleteMessage(activeMessageId)
-                                Log.d(TAG, "🗑️ Deleted empty active message after recovery attempt (Korean: '$recoveredKorean', English: '$recoveredEnglish')")
+                            } else {
+                                // FIXED: Preserve Korean-only message instead of deleting
+                                Log.d(TAG, "💾 No backup available - preserving Korean-only message for manual review")
+                                val koreanOnlyMessage = activeMessage.copy(
+                                    originalText = koreanText,
+                                    translatedText = "[Translation failed - Korean text preserved]", 
+                                    confidence = 0.0f,
+                                    translationEngine = TranslationEngine.ML_KIT,
+                                    isActive = false
+                                )
+                                
+                                try {
+                                    translationRepository.updateMessage(koreanOnlyMessage)
+                                    currentSegmentNumber++
+                                    Log.d(TAG, "✅ Preserved Korean text: '$koreanText' (translation can be retried)")
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "❌ Failed to preserve Korean text", e)
+                                    // NEVER DELETE - mark as inactive even if preservation fails
+                                    translationRepository.setMessageInactive(activeMessageId)
+                                    Log.d(TAG, "🔒 Message marked inactive after preservation failure - Korean text retained")
+                                }
                             }
                         }
                     }
@@ -997,12 +1012,12 @@ class OptimizedTranslationViewModel @Inject constructor(
                 // Clear active message tracking
                 currentActiveMessageId = null
                 
-                // Clear UI partial text and accumulation state
+                // PRESERVE USER TEXT: Keep accumulated text visible to user
+                // Only clear accumulation state, not the visible text
                 _uiState.update { 
                     it.copy(
-                        currentPartialText = null,
-                        currentPartialTranslation = null,
-                        isAccumulatingMessage = false // Reset accumulation state
+                        isAccumulatingMessage = false // Reset accumulation state only
+                        // KEEP: currentPartialText and currentPartialTranslation visible
                     )
                 }
                 
@@ -1088,14 +1103,14 @@ class OptimizedTranslationViewModel @Inject constructor(
                     val englishText = orphanedActiveMessage.translatedText.trim()
                     
                     // Check if the orphaned message has meaningful content
-                    if (koreanText.length >= MIN_MESSAGE_LENGTH && englishText.isNotBlank()) {
-                        // Orphan has content - finalize it
+                    if (koreanText.length >= MIN_MESSAGE_LENGTH || englishText.isNotBlank()) {
+                        // Orphan has content (Korean OR English) - finalize it
                         translationRepository.setMessageInactive(orphanedActiveMessage.id)
-                        Log.d(TAG, "Finalized orphaned active message: '$koreanText' -> '$englishText'")
+                        Log.d(TAG, "Preserved orphaned message with content: Korean='$koreanText', English='$englishText'")
                     } else {
-                        // Orphan is empty - delete it
-                        translationRepository.deleteMessage(orphanedActiveMessage.id)
-                        Log.d(TAG, "Deleted empty orphaned active message")
+                        // Only delete if truly empty (no Korean AND no English)
+                        translationRepository.setMessageInactive(orphanedActiveMessage.id)  
+                        Log.d(TAG, "Preserved potentially empty message for user review")
                     }
                 }
             } catch (e: Exception) {
@@ -1132,16 +1147,16 @@ class OptimizedTranslationViewModel @Inject constructor(
                 Log.d(TAG, "Starting recording - continuous mode: $continuousMode")
                 Log.d(TAG, "Continuing conversation ID: $currentConversationId")
                 
-                // Clear previous partial translations for fresh start
-                _uiState.update { 
-                    it.copy(
-                        currentPartialText = null,
-                        currentPartialTranslation = null,
+                // Clear only states, preserve accumulated text from previous session
+                _uiState.update { currentState ->
+                    // PRESERVE: Keep previous session's text visible until new text arrives
+                    currentState.copy(
                         error = null,
                         isTranslating = false,
                         isEnhancing = false,
                         isLoading = false,
                         continuousRecordingMode = continuousMode
+                        // KEEP: currentPartialText and currentPartialTranslation from previous session
                     ) 
                 }
                 
@@ -1359,22 +1374,18 @@ class OptimizedTranslationViewModel @Inject constructor(
     }
     
     /**
-     * Clear current partial translation only if no final translation exists
-     * For real-time display, keep showing last translation until next recording
+     * Clear current partial translation only when explicitly requested
+     * For real-time display, keep showing accumulated text to user
      */
     private fun clearCurrentTranslation() {
         _uiState.update { currentState ->
-            // Only clear partial text if we don't have a completed translation to show
-            val hasCompletedTranslation = currentState.currentPartialTranslation?.isNotBlank() == true
-            
+            // PRESERVE USER TEXT: Only clear states, keep text visible
             currentState.copy(
-                // Keep partial text/translation visible if there's a completed result
-                currentPartialText = if (hasCompletedTranslation) currentState.currentPartialText else null,
-                currentPartialTranslation = if (hasCompletedTranslation) currentState.currentPartialTranslation else null,
                 currentTranslationState = TranslationState.Idle,
                 isTranslating = false,
                 isEnhancing = false,
                 isLoading = false
+                // KEEP: currentPartialText and currentPartialTranslation remain visible
             )
         }
     }
@@ -1407,12 +1418,11 @@ class OptimizedTranslationViewModel @Inject constructor(
                     finalizeActiveMessage()
                 }
                 
-                // Reset accumulation state
+                // Reset accumulation state but preserve visible text
                 _uiState.update { 
                     it.copy(
-                        isAccumulatingMessage = false,
-                        currentPartialText = null,
-                        currentPartialTranslation = null
+                        isAccumulatingMessage = false
+                        // KEEP: currentPartialText and currentPartialTranslation visible
                     ) 
                 }
                 
@@ -1437,12 +1447,14 @@ class OptimizedTranslationViewModel @Inject constructor(
             Log.d(TAG, "New conversation started with ID: $currentConversationId")
             
             translationManager.clearSession()
+            // Clear UI state for new conversation
             _uiState.update { 
                 it.copy(
                     currentPartialText = null, 
                     currentPartialTranslation = null,
                     error = null,
-                    isLoading = false
+                    isLoading = false,
+                    isAccumulatingMessage = false // Reset accumulation for new conversation
                 ) 
             }
         }

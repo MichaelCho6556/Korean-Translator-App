@@ -101,10 +101,11 @@ class GeminiApiService @Inject constructor() {
         .add("*.googleapis.com", "sha256/1lgYMXKg74_9FfFUAahQz6QQ3n4-lWi6t1Jq7rvWy0M=") // DigiCert Global Root CA
         .build()
 
-    // Create OkHttpClient with optimized connection pooling, timeouts, and certificate pinning
+    // Create OkHttpClient with optimized connection pooling and timeouts
+    // NOTE: Certificate pinning temporarily disabled for Google certificate rotation compatibility
     private val okHttpClient = OkHttpClient.Builder()
         .addInterceptor(loggingInterceptor)
-        .certificatePinner(certificatePinner) // Add certificate pinning for security
+        // .certificatePinner(certificatePinner) // DISABLED: Outdated pins causing SSL failures
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)

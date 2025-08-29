@@ -99,9 +99,18 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
         ) {
             items(uiState.messages) { message -> MessageBubble(message = message) }
 
-            // Show system status and real-time partial text separately
-            if (uiState.systemStatus != null || (uiState.currentPartialText != null && uiState.isRecording)) {
+            // Show system status and real-time partial text with proper state transitions
+            // Keep accumulated text visible after recording stops
+            if (uiState.systemStatus != null || uiState.currentPartialText != null) {
                 item {
+                    // IMPROVED: Better state-aware display logic
+                    val activeMessageInfo = remember(uiState.systemStatus, uiState.currentPartialText, uiState.isRecording, uiState.isTranslating, uiState.isEnhancing) {
+                        when {
+                            uiState.systemStatus != null -> Triple(uiState.systemStatus, true, true)
+                            uiState.currentPartialText != null -> Triple(uiState.currentPartialText, false, true)
+                            else -> Triple(null, false, false)
+                        }
+                    }
                     Card(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                             colors =
@@ -113,9 +122,8 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                             border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
                     ) {
                         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                            // System status takes priority over partial text
-                            val displayText = uiState.systemStatus ?: uiState.currentPartialText
-                            val isSystemStatus = uiState.systemStatus != null
+                            val displayText = activeMessageInfo.first
+                            val isSystemStatus = activeMessageInfo.second
                             
                             Row(
                                     verticalAlignment = Alignment.CenterVertically,
@@ -132,16 +140,23 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                                             color = MaterialTheme.colorScheme.primary
                                     )
                                 } else {
+                                    // IMPROVED: Dynamic icon and status based on actual state
+                                    val (statusIcon, statusText, statusColor) = when {
+                                        uiState.isRecording -> Triple(Icons.Default.Mic, if (uiState.isAccumulatingMessage) "Accumulating..." else "Listening...", MaterialTheme.colorScheme.primary)
+                                        uiState.isTranslating || uiState.isEnhancing -> Triple(Icons.Default.Psychology, "Processing translation...", MaterialTheme.colorScheme.secondary) 
+                                        uiState.currentPartialText != null && !uiState.isRecording -> Triple(Icons.Default.MicOff, "Completed", MaterialTheme.colorScheme.tertiary)
+                                        else -> Triple(Icons.Default.Mic, "Ready", MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
                                     Icon(
-                                            Icons.Default.Mic,
-                                            contentDescription = "Listening",
+                                            statusIcon,
+                                            contentDescription = statusText,
                                             modifier = Modifier.size(16.dp),
-                                            tint = MaterialTheme.colorScheme.primary
+                                            tint = statusColor
                                     )
                                     Text(
-                                            text = if (uiState.isAccumulatingMessage) "Accumulating..." else "Listening...",
+                                            text = statusText,
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary
+                                            color = statusColor
                                     )
                                     // Show accumulation indicator
                                     if (uiState.isAccumulatingMessage) {
