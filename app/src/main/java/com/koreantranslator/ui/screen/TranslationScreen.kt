@@ -140,12 +140,42 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                                             color = MaterialTheme.colorScheme.primary
                                     )
                                 } else {
-                                    // IMPROVED: Dynamic icon and status based on actual state
-                                    val (statusIcon, statusText, statusColor) = when {
-                                        uiState.isRecording -> Triple(Icons.Default.Mic, if (uiState.isAccumulatingMessage) "Accumulating..." else "Listening...", MaterialTheme.colorScheme.primary)
-                                        uiState.isTranslating || uiState.isEnhancing -> Triple(Icons.Default.Psychology, "Processing translation...", MaterialTheme.colorScheme.secondary) 
-                                        uiState.currentPartialText != null && !uiState.isRecording -> Triple(Icons.Default.MicOff, "Completed", MaterialTheme.colorScheme.tertiary)
-                                        else -> Triple(Icons.Default.Mic, "Ready", MaterialTheme.colorScheme.onSurfaceVariant)
+                                    // PROFESSIONAL: Use SessionState for accurate status display
+                                    val (statusIcon, statusText, statusColor) = when (uiState.sessionState) {
+                                        is SessionState.Recording -> Triple(
+                                            Icons.Default.Mic, 
+                                            if (uiState.isAccumulatingMessage) "Accumulating..." else "Listening...", 
+                                            MaterialTheme.colorScheme.primary
+                                        )
+                                        is SessionState.Processing -> Triple(
+                                            Icons.Default.Psychology, 
+                                            "Processing translation...", 
+                                            MaterialTheme.colorScheme.secondary
+                                        )
+                                        is SessionState.Finalizing -> Triple(
+                                            Icons.Default.Psychology, 
+                                            "Saving message...", 
+                                            MaterialTheme.colorScheme.secondary
+                                        )
+                                        is SessionState.Completed -> Triple(
+                                            Icons.Default.MicOff, 
+                                            "Completed", 
+                                            MaterialTheme.colorScheme.tertiary
+                                        )
+                                        is SessionState.Error -> Triple(
+                                            Icons.Default.MicOff, 
+                                            "Error", 
+                                            MaterialTheme.colorScheme.error
+                                        )
+                                        is SessionState.Idle -> {
+                                            // Fallback to boolean logic for backward compatibility
+                                            when {
+                                                uiState.isRecording -> Triple(Icons.Default.Mic, "Listening...", MaterialTheme.colorScheme.primary)
+                                                uiState.isTranslating || uiState.isEnhancing -> Triple(Icons.Default.Psychology, "Processing...", MaterialTheme.colorScheme.secondary)
+                                                uiState.currentPartialText != null -> Triple(Icons.Default.MicOff, "Ready", MaterialTheme.colorScheme.tertiary)
+                                                else -> Triple(Icons.Default.Mic, "Ready", MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                        }
                                     }
                                     Icon(
                                             statusIcon,

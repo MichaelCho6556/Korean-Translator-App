@@ -182,6 +182,9 @@ class SonioxStreamingService @Inject constructor(
     // Real-time partial token accumulator for proper Korean spacing
     private val partialTokenAccumulator = mutableListOf<String>()
     
+    // UNIFIED ACCUMULATOR: Track finalized token count to prevent duplication
+    private var lastFinalizedTokenCount = 0
+    
     // SENTENCE ACCUMULATION: Fix fragmentation by accumulating until sentence completion
     private val sentenceAccumulator = StringBuilder()
     private var lastTokenTime = 0L
@@ -261,6 +264,10 @@ class SonioxStreamingService @Inject constructor(
         sentenceTimeoutJob?.cancel()
         lastTokenTime = 0L
         
+        // UNIFIED ACCUMULATOR: Reset token tracking for new session
+        partialTokenAccumulator.clear()
+        lastFinalizedTokenCount = 0
+        
         // CRITICAL FIX: Clear token state to prevent contamination
         clearTokenState()
         
@@ -309,6 +316,10 @@ class SonioxStreamingService @Inject constructor(
         sentenceAccumulator.clear()
         sentenceTimeoutJob?.cancel()
         lastTokenTime = 0L
+        
+        // UNIFIED ACCUMULATOR: Clear partial token state
+        partialTokenAccumulator.clear()
+        lastFinalizedTokenCount = 0
         
         // Cancel debouncing job and reset state
         partialTextDebounceJob?.cancel()
@@ -752,8 +763,20 @@ class SonioxStreamingService @Inject constructor(
                 ?: emptyList()
             
             if (finalTokens.isNotEmpty()) {
-                // Clear partial accumulator when final results arrive
-                partialTokenAccumulator.clear()
+                // UNIFIED ACCUMULATOR FIX: Only clear partial tokens that have been finalized
+                // Remove finalized tokens from partial accumulator to prevent duplication
+                val currentTotalTokens = (sonioxResponse.tokens?.count { it.isFinal == true } ?: 0)
+                if (currentTotalTokens > lastFinalizedTokenCount) {
+                    // New tokens have been finalized - remove them from partial display
+                    val tokensToRemove = currentTotalTokens - lastFinalizedTokenCount
+                    repeat(minOf(tokensToRemove, partialTokenAccumulator.size)) {
+                        if (partialTokenAccumulator.isNotEmpty()) {
+                            partialTokenAccumulator.removeAt(0) // Remove from beginning (oldest first)
+                        }
+                    }
+                    lastFinalizedTokenCount = currentTotalTokens
+                    Log.d(TAG, "Removed $tokensToRemove finalized tokens from partial accumulator")
+                }
                 
                 // Fix Korean spacing - join tokens without spaces for proper Korean text
                 val directText = joinKoreanTokensProper(finalTokens)
@@ -796,8 +819,11 @@ class SonioxStreamingService @Inject constructor(
                     val currentAccumulation = sentenceAccumulator.toString()
                     Log.d(TAG, "Accumulated: '$currentAccumulation'")
                     
+                    // UNIFIED DISPLAY: Combine sentence accumulator with remaining partial tokens
+                    val combinedDisplayText = buildCombinedDisplayText(currentAccumulation)
+                    
                     // Update partial text with debouncing to prevent UI spam
-                    updatePartialTextWithDebouncing(currentAccumulation)
+                    updatePartialTextWithDebouncing(combinedDisplayText)
                     
                     // Check if sentence is complete (with edge case protection)
                     if (isSentenceComplete(currentAccumulation) && !sentenceCompletionInProgress) {
@@ -824,17 +850,17 @@ class SonioxStreamingService @Inject constructor(
                 ?: emptyList()
             
             if (nonFinalTokens.isNotEmpty()) {
-                // Accumulate partial tokens (they come as individual syllables)
+                // REPLACE PARTIAL TOKENS: Clear first since Soniox sends CUMULATIVE partial tokens
+                // Each update from Soniox contains ALL partial tokens, not just new ones
                 partialTokenAccumulator.clear()
                 partialTokenAccumulator.addAll(nonFinalTokens)
                 
-                // Join all accumulated tokens without spaces first
-                val joinedText = partialTokenAccumulator.joinToString("")
+                // UNIFIED DISPLAY: Combine sentence accumulator with all partial tokens
+                val sentenceText = sentenceAccumulator.toString()
+                val combinedDisplayText = buildCombinedDisplayText(sentenceText)
                 
-                // FIXED: For partial text, skip Korean NLP processing to prevent fragmentation
-                // Korean NLP should only process complete sentences, not partial real-time text
-                Log.d(TAG, "Real-time partial (no NLP processing): '$joinedText'")
-                updatePartialTextWithDebouncing(joinedText)
+                Log.d(TAG, "Real-time appending - Final: '$sentenceText', Partial tokens: ${partialTokenAccumulator.size}, Combined: '${combinedDisplayText.take(50)}...'")
+                updatePartialTextWithDebouncing(combinedDisplayText)
             }
             
             // Log completion
@@ -1087,6 +1113,35 @@ class SonioxStreamingService @Inject constructor(
     }
     
     /**
+     * UNIFIED DISPLAY BUILDER: Combine finalized sentence text with current partial tokens
+     * This creates the smooth appending effect by showing: final_text + partial_tokens
+     */
+    private fun buildCombinedDisplayText(finalizedText: String): String {
+        if (partialTokenAccumulator.isEmpty()) {
+            return finalizedText
+        }
+        
+        // Join partial tokens without spaces (Korean doesn't need spaces between syllables)
+        val partialText = partialTokenAccumulator.joinToString("")
+        
+        return if (finalizedText.isEmpty()) {
+            partialText
+        } else {
+            // Add appropriate spacing between finalized and partial text
+            val needsSpace = !finalizedText.endsWith(" ") && 
+                           partialText.isNotEmpty() && 
+                           koreanTextValidator.containsKorean(finalizedText) &&
+                           koreanTextValidator.containsKorean(partialText)
+            
+            if (needsSpace) {
+                "$finalizedText $partialText"
+            } else {
+                "$finalizedText$partialText"
+            }
+        }
+    }
+
+    /**
      * ENHANCED SENTENCE COMPLETION: Check if text forms complete sentence with conversation context
      * FIXED: Now waits for speech continuity instead of immediately completing on Korean endings
      */
@@ -1152,8 +1207,10 @@ class SonioxStreamingService @Inject constructor(
         
         Log.d(TAG, "Processing complete sentence: '$trimmedSentence' (forced: $forceComplete)")
         
-        // Clear accumulator
+        // Clear accumulator and partial tokens (sentence is complete)
         sentenceAccumulator.clear()
+        partialTokenAccumulator.clear()
+        lastFinalizedTokenCount = 0
         sentenceTimeoutJob?.cancel()
         
         // Process the complete sentence with confidence-aware corrector

@@ -150,8 +150,8 @@ class KoreanNLPService @Inject constructor(
         
         Log.d(TAG, "Fixing spacing for: '$text'")
         
-        // Check if this looks like syllable-separated Korean
-        if (!needsSpacingFix(text)) {
+        // Check if this looks like syllable-separated Korean or if it's already properly spaced
+        if (!needsSpacingFix(text) || hasProperKoreanSpacing(text)) {
             Log.d(TAG, "Text doesn't need spacing fix")
             return@withContext text
         }
@@ -228,6 +228,28 @@ class KoreanNLPService @Inject constructor(
         }
         
         return false
+    }
+    
+    /**
+     * Check if Korean text already has proper spacing and shouldn't be reprocessed
+     */
+    private fun hasProperKoreanSpacing(text: String): Boolean {
+        // If text has reasonable distribution of Korean words separated by spaces, it's likely properly spaced
+        val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        
+        // If single token (no spaces), it's not properly spaced (unless very short)
+        if (tokens.size == 1) {
+            return text.length <= 3 // Short phrases like "안녕" are fine
+        }
+        
+        // Check if tokens are reasonable Korean word lengths (1-4 syllables typically)
+        val hasReasonableTokens = tokens.all { token ->
+            val koreanSyllables = token.count { it in '가'..'힣' }
+            koreanSyllables in 1..6 // Allow up to 6 syllables per word
+        }
+        
+        // If we have multiple tokens of reasonable length, assume it's properly spaced
+        return hasReasonableTokens && tokens.size >= 2
     }
     
     /**

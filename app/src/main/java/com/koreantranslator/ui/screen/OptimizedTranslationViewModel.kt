@@ -12,6 +12,7 @@ import com.koreantranslator.repository.TranslationRepository
 import com.koreantranslator.service.SonioxStreamingService
 import com.koreantranslator.service.TranslationManager
 import com.koreantranslator.service.ProductionAlertingService
+import com.koreantranslator.nlp.KoreanNLPService
 import com.koreantranslator.util.SentenceDetectionConstants
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.*
@@ -52,6 +53,18 @@ data class TranslationBackup(
 )
 
 /**
+ * Professional session state management for recording and translation
+ */
+sealed class SessionState {
+    object Idle : SessionState()
+    object Recording : SessionState()
+    object Processing : SessionState()
+    object Finalizing : SessionState()
+    data class Completed(val message: String, val timestamp: Long) : SessionState()
+    data class Error(val message: String) : SessionState()
+}
+
+/**
  * Optimized Translation ViewModel with dual-engine architecture
  * Features:
  * - Smart debouncing to prevent API flooding
@@ -65,7 +78,8 @@ class OptimizedTranslationViewModel @Inject constructor(
     private val sonioxStreamingService: SonioxStreamingService,
     private val translationManager: TranslationManager,
     private val translationRepository: TranslationRepository,
-    private val productionAlertingService: ProductionAlertingService
+    private val productionAlertingService: ProductionAlertingService,
+    private val koreanNLPService: KoreanNLPService
 ) : AndroidViewModel(application) {
     
     companion object {
@@ -87,6 +101,7 @@ class OptimizedTranslationViewModel @Inject constructor(
     // UI State with translation-specific properties
     data class OptimizedTranslationState(
         val messages: List<TranslationMessage> = emptyList(),
+        val sessionState: SessionState = SessionState.Idle, // Professional state management
         val isRecording: Boolean = false,
         val isTranslating: Boolean = false,
         val isEnhancing: Boolean = false,
@@ -149,6 +164,9 @@ class OptimizedTranslationViewModel @Inject constructor(
     private val activeMessageUpdateTrigger = MutableSharedFlow<MessageUpdate>()
     private var activeMessageUpdateJob: Job? = null
     
+    // Professional finalization job for proper state management
+    private var finalizationJob: Job? = null
+    
     // Performance tracking
     private val sessionStartTime = System.currentTimeMillis()
     private val translationLatencies = mutableListOf<Long>()
@@ -203,13 +221,17 @@ class OptimizedTranslationViewModel @Inject constructor(
                     }
                     isCompleteSentence
                 }
-                .collect { recognizedText ->
-                    Log.d(TAG, "Complete sentence received for translation: '${recognizedText.take(50)}...'")
+                .collect { rawRecognizedText ->
+                    Log.d(TAG, "Complete sentence received for translation: '${rawRecognizedText.take(50)}...'")
+                    
+                    // FIXED: Process Korean text through NLP service for proper spacing
+                    val processedKoreanText = koreanNLPService.process(rawRecognizedText.trim())
+                    Log.d(TAG, "Korean NLP processed: '${rawRecognizedText.trim()}' -> '$processedKoreanText'")
                     
                     // CRITICAL BACKUP: Immediately create backup when Korean text is recognized
                     // This ensures Korean text is never lost, even if translation fails
                     val koreanTextBackup = TranslationBackup(
-                        koreanText = recognizedText.trim(),
+                        koreanText = processedKoreanText, // Use processed text with proper spacing
                         englishText = "", // No translation yet, but Korean is preserved
                         confidence = 0.0f,
                         timestamp = System.currentTimeMillis(),
@@ -217,7 +239,7 @@ class OptimizedTranslationViewModel @Inject constructor(
                         isComplete = true
                     )
                     lastSuccessfulTranslation = koreanTextBackup
-                    Log.d(TAG, "💾 Created immediate Korean backup: '${recognizedText.trim()}'")
+                    Log.d(TAG, "💾 Created immediate Korean backup: '$processedKoreanText'")
                     
                     // CRITICAL FIX: Always translate just the NEW sentence, accumulation happens in handleSuccessfulTranslation
                     // RACE CONDITION GUARD: Prevent multiple simultaneous translations
@@ -228,10 +250,10 @@ class OptimizedTranslationViewModel @Inject constructor(
                             translationJob?.cancel()
                             delay(50) // Brief delay to let cancellation complete
                         }
-                        translationTrigger.emit(recognizedText.trim())
+                        translationTrigger.emit(processedKoreanText)
                     }
                     
-                    Log.d(TAG, "Translating NEW sentence only: '${recognizedText.trim()}'")
+                    Log.d(TAG, "Translating NEW sentence only: '$processedKoreanText'")
                     if (_uiState.value.isAccumulatingMessage) {
                         Log.d(TAG, "Will accumulate this translation result to existing message")
                     } else {
@@ -266,10 +288,9 @@ class OptimizedTranslationViewModel @Inject constructor(
                     createOrContinueActiveMessage()
                     Log.d(TAG, "Recording started - created or continued active message")
                 } else {
-                    // Finalize active message when recording stops - but keep UI text visible
-                    finalizeActiveMessage()
-                    // DON'T clear UI immediately - let user see accumulated text
-                    Log.d(TAG, "Recording stopped - finalized active message")
+                    // CRITICAL FIX: Don't auto-finalize here - let professional stopRecording() handle it
+                    // This prevents double finalization race condition
+                    Log.d(TAG, "Recording stopped - finalization will be handled by stopRecording()")
                 }
             }
         }
@@ -302,7 +323,7 @@ class OptimizedTranslationViewModel @Inject constructor(
     private fun observeActiveMessageUpdateDebouncing() {
         viewModelScope.launch {
             activeMessageUpdateTrigger
-                .debounce(500L) // Wait 500ms between database updates
+                .debounce(100L) // FIXED: Reduced from 500ms to 100ms to prevent race conditions with finalization
                 .distinctUntilChanged() // Don't update with same content
                 .collect { update ->
                     when (update) {
@@ -373,6 +394,7 @@ class OptimizedTranslationViewModel @Inject constructor(
     
     /**
      * Start translation with the dual-engine system
+     * Korean text is already processed through NLP service in observeSpeechRecognition()
      */
     private fun startTranslation(koreanText: String) {
         // Cancel any existing translation
@@ -389,7 +411,7 @@ class OptimizedTranslationViewModel @Inject constructor(
                 
                 // Use TranslationManager's dual-engine approach
                 val translationFlow = translationManager.translateWithDualEngine(
-                    koreanText = koreanText,
+                    koreanText = koreanText, // Text is already processed through NLP
                     useContext = true // Use conversation context
                 )
                 
@@ -543,14 +565,15 @@ class OptimizedTranslationViewModel @Inject constructor(
                     return@launch
                 }
                 
-                // Check if we should continue accumulating to the most recent message
-                val mostRecentMessage = translationRepository.getMostRecentMessage()
+                // FIXED: Check if we should continue accumulating to the ACTIVE message (not just most recent)
+                // This prevents checking old inactive messages and getting huge time gaps
+                val activeMessage = translationRepository.getActiveMessage()
                 val currentTime = System.currentTimeMillis()
                 
-                if (mostRecentMessage != null) {
-                    val timeSinceLastMessage = currentTime - mostRecentMessage.timestamp.time
+                if (activeMessage != null) {
+                    val timeSinceLastMessage = currentTime - activeMessage.timestamp.time
                     // RACE CONDITION FIX: Check atomic finalization tracking
-                    val isMessageBeingFinalized = isMessageFinalizing(mostRecentMessage.id)
+                    val isMessageBeingFinalized = isMessageFinalizing(activeMessage.id)
                     // ENHANCED: Extend accumulation timeout during active recording sessions
                     val isActivelyRecording = _uiState.value.isRecording
                     val extendedTimeout = if (isActivelyRecording) {
@@ -560,9 +583,9 @@ class OptimizedTranslationViewModel @Inject constructor(
                     }
                     
                     val canAccumulate = timeSinceLastMessage < extendedTimeout &&
-                                       mostRecentMessage.originalText.length < MAX_ACCUMULATED_LENGTH &&
-                                       mostRecentMessage.conversationId == currentConversationId &&
-                                       !mostRecentMessage.isActive &&
+                                       activeMessage.originalText.length < MAX_ACCUMULATED_LENGTH &&
+                                       activeMessage.conversationId == currentConversationId &&
+                                       !activeMessage.isActive &&
                                        !isMessageBeingFinalized
                                        
                     if (isActivelyRecording) {
@@ -576,16 +599,16 @@ class OptimizedTranslationViewModel @Inject constructor(
                         try {
                             // Step 1: Perform database operation FIRST (authoritative source)
                             invalidateActiveMessageCache()
-                            translationRepository.setMessageActive(mostRecentMessage.id)
+                            translationRepository.setMessageActive(activeMessage.id)
                             
                             // Step 2: Only after database success, update UI state and internal tracking
-                            currentActiveMessageId = mostRecentMessage.id
+                            currentActiveMessageId = activeMessage.id
                             _uiState.update { it.copy(isAccumulatingMessage = true) }
                             
                             Log.d(TAG, "✅ ATOMIC SUCCESS: Database and UI state now consistent")
-                            Log.d(TAG, "   Message ID: ${mostRecentMessage.id}")
+                            Log.d(TAG, "   Message ID: ${activeMessage.id}")
                             Log.d(TAG, "   Time since last: ${timeSinceLastMessage}ms")
-                            Log.d(TAG, "   Message length: ${mostRecentMessage.originalText.length} chars")
+                            Log.d(TAG, "   Message length: ${activeMessage.originalText.length} chars")
                             
                             trackAccumulationMetrics("ATOMIC_TRANSITION", true, stateMismatch = false)
                             return@launch
@@ -605,7 +628,7 @@ class OptimizedTranslationViewModel @Inject constructor(
                         createNewActiveMessage()
                         return@launch
                     } else {
-                        Log.d(TAG, "Cannot accumulate - time gap: ${timeSinceLastMessage}ms, length: ${mostRecentMessage.originalText.length}, isActive: ${mostRecentMessage.isActive}")
+                        Log.d(TAG, "Cannot accumulate - time gap: ${timeSinceLastMessage}ms, length: ${activeMessage.originalText.length}, isActive: ${activeMessage.isActive}")
                     }
                 }
                 
@@ -884,154 +907,177 @@ class OptimizedTranslationViewModel @Inject constructor(
     /**
      * Finalize active message when recording stops - deletes if empty
      */
-    private fun finalizeActiveMessage() {
-        viewModelScope.launch {
-            activeMessageMutex.withLock {
+    /**
+     * Professional message finalization with comprehensive error handling
+     */
+    private suspend fun finalizeActiveMessage() {
+        activeMessageMutex.withLock {
             try {
                 val activeMessageId = currentActiveMessageId
                 if (activeMessageId == null) {
                     Log.d(TAG, "No active message to finalize")
-                    return@launch
+                    return
                 }
+                
+                Log.d(TAG, "Professional finalization started for message: $activeMessageId")
                 
                 // Mark message as being finalized to prevent race conditions
                 markMessageFinalizing(activeMessageId)
                 
                 try {
-                    // CRITICAL FIX: Force flush any pending database updates before checking message content
-                    // This prevents the race condition where translations are lost due to debounced updates
-                    Log.d(TAG, "🚨 RACE CONDITION FIX: Force-flushing pending updates before finalization")
+                    // Step 1: Ensure all operations are complete with professional retry
+                    ensureAllOperationsComplete(activeMessageId)
                     
-                    // Step 1: Check if there are any pending updates and flush them immediately
-                    try {
-                        // Force immediate processing of any queued updates
-                        val lastPendingUpdate = activeMessageUpdateTrigger.replayCache.lastOrNull()
-                        if (lastPendingUpdate != null) {
-                            Log.d(TAG, "Found pending update - executing immediately: ${lastPendingUpdate::class.simpleName}")
-                            when (lastPendingUpdate) {
-                                is MessageUpdate.Accumulate -> {
-                                    performActiveMessageUpdate(lastPendingUpdate.koreanText, lastPendingUpdate.englishText, shouldAccumulate = true)
-                                }
-                                is MessageUpdate.Replace -> {
-                                    performActiveMessageUpdate(lastPendingUpdate.koreanText, lastPendingUpdate.englishText, shouldAccumulate = false)
-                                }
-                            }
-                            // Enhanced safety margin to ensure database write completes (increased from 50ms to 100ms)
-                            delay(100)
-                            Log.d(TAG, "✅ Pending update flushed successfully")
-                        }
-                    } catch (flushException: Exception) {
-                        Log.w(TAG, "Failed to flush pending updates", flushException)
-                    }
+                    // Step 2: Get final message state with retry mechanism
+                    val message = getActiveMessageWithRetry(activeMessageId)
                     
-                    // Get the current active message
-                    val activeMessage = translationRepository.getActiveMessage()
-                    if (activeMessage != null && activeMessage.id == activeMessageId) {
-                        val koreanText = activeMessage.originalText.trim()
-                        val englishText = activeMessage.translatedText.trim()
+                    if (message != null) {
+                        Log.d(TAG, "Retrieved message for finalization: Korean='${message.originalText.take(30)}...', English='${message.translatedText.take(30)}...'")
                         
-                        // Invalidate cache BEFORE database operations
-                        invalidateActiveMessageCache()
-                        
-                        // ENHANCED MESSAGE PRESERVATION: Prioritize Korean text preservation
-                        if (koreanText.length >= MIN_MESSAGE_LENGTH && englishText.isNotBlank()) {
-                            // Message has both Korean and English - finalize it
+                        // Step 3: Decide whether to delete or preserve based on content
+                        if (shouldDeleteMessage(message)) {
+                            Log.d(TAG, "Deleting empty message: $activeMessageId")
+                            translationRepository.deleteMessage(activeMessageId)
+                        } else {
+                            Log.d(TAG, "Preserving message: $activeMessageId")
                             translationRepository.setMessageInactive(activeMessageId)
                             currentSegmentNumber++
-                            Log.d(TAG, "✅ Finalized complete message: '$koreanText' -> '$englishText'")
-                        } else if (koreanText.length >= MIN_MESSAGE_LENGTH) {
-                            // Korean text exists but no translation - preserve Korean text
-                            Log.d(TAG, "📝 Korean text exists but translation failed - preserving Korean-only message")
-                            
-                            // FIRST: Try backup recovery with extended window
-                            val backupTranslation = lastSuccessfulTranslation
-                            val hasValidBackup = backupTranslation != null && 
-                                                backupTranslation.koreanText.trim().length >= MIN_MESSAGE_LENGTH &&
-                                                backupTranslation.englishText.trim().isNotEmpty() &&
-                                                (System.currentTimeMillis() - backupTranslation.timestamp) < 10000 // Extended to 10 seconds
-                            
-                            if (hasValidBackup) {
-                                // Use backup data for recovery
-                                try {
-                                    val recoveredMessage = activeMessage.copy(
-                                        originalText = backupTranslation!!.koreanText.trim(),
-                                        translatedText = backupTranslation.englishText.trim(),
-                                        isActive = false
-                                    )
-                                    translationRepository.updateMessage(recoveredMessage)
-                                    currentSegmentNumber++
-                                    
-                                    Log.d(TAG, "✅ RECOVERY: Used recent backup data")
-                                    Log.d(TAG, "   Korean: '${backupTranslation.koreanText}'")
-                                    Log.d(TAG, "   English: '${backupTranslation.englishText}'")
-                                    
-                                    // Clear backup after successful recovery
-                                    lastSuccessfulTranslation = null
-                                    
-                                } catch (recoveryException: Exception) {
-                                    Log.e(TAG, "❌ RECOVERY FAILED: Could not save backup data", recoveryException)
-                                    // Preserve Korean text even if recovery fails
-                                    val koreanOnlyMessage = activeMessage.copy(
-                                        originalText = koreanText,
-                                        translatedText = "[Translation failed - manual retry needed]", 
-                                        confidence = 0.0f,
-                                        isActive = false
-                                    )
-                                    translationRepository.updateMessage(koreanOnlyMessage)
-                                    Log.d(TAG, "💾 Preserved Korean text after recovery failure: '$koreanText'")
-                                }
-                            } else {
-                                // FIXED: Preserve Korean-only message instead of deleting
-                                Log.d(TAG, "💾 No backup available - preserving Korean-only message for manual review")
-                                val koreanOnlyMessage = activeMessage.copy(
-                                    originalText = koreanText,
-                                    translatedText = "[Translation failed - Korean text preserved]", 
-                                    confidence = 0.0f,
-                                    translationEngine = TranslationEngine.ML_KIT,
-                                    isActive = false
-                                )
-                                
-                                try {
-                                    translationRepository.updateMessage(koreanOnlyMessage)
-                                    currentSegmentNumber++
-                                    Log.d(TAG, "✅ Preserved Korean text: '$koreanText' (translation can be retried)")
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "❌ Failed to preserve Korean text", e)
-                                    // NEVER DELETE - mark as inactive even if preservation fails
-                                    translationRepository.setMessageInactive(activeMessageId)
-                                    Log.d(TAG, "🔒 Message marked inactive after preservation failure - Korean text retained")
-                                }
-                            }
                         }
+                    } else {
+                        Log.w(TAG, "Message not found during finalization: $activeMessageId")
                     }
+                    
                 } finally {
-                    // Always clear finalization mark when done
-                    clearFinalizationMark(activeMessageId)
+                    // Always clear finalization mark
+                    clearMessageFinalizing(activeMessageId)
                 }
                 
                 // Clear active message tracking
                 currentActiveMessageId = null
                 
-                // PRESERVE USER TEXT: Keep accumulated text visible to user
-                // Only clear accumulation state, not the visible text
-                _uiState.update { 
-                    it.copy(
-                        isAccumulatingMessage = false // Reset accumulation state only
-                        // KEEP: currentPartialText and currentPartialTranslation visible
-                    )
-                }
-                
-                Log.d(TAG, "🏁 Ready for next message segment: $currentSegmentNumber")
+                Log.d(TAG, "Professional finalization completed successfully")
                 
             } catch (e: Exception) {
-                Log.e(TAG, "❌ Failed to finalize active message", e)
+                Log.e(TAG, "Professional finalization failed", e)
+                
                 // Clear finalization mark on error
-                if (currentActiveMessageId != null) {
-                    clearFinalizationMark(currentActiveMessageId!!)
+                currentActiveMessageId?.let { id ->
+                    clearMessageFinalizing(id)
+                }
+                
+                throw e // Re-throw for error handling at higher level
+            }
+        }
+    }
+    
+    /**
+     * Ensure all operations complete before finalization
+     */
+    private suspend fun ensureAllOperationsComplete(messageId: String) {
+        Log.d(TAG, "Ensuring all operations complete for: $messageId")
+        
+        // ENHANCED: Wait for debounced updates to process (100ms debounce + buffer)
+        delay(150)
+        
+        // Force flush any still-pending updates
+        val lastPendingUpdate = activeMessageUpdateTrigger.replayCache.lastOrNull()
+        if (lastPendingUpdate != null) {
+            Log.d(TAG, "Found pending update - executing immediately: ${lastPendingUpdate::class.simpleName}")
+            when (lastPendingUpdate) {
+                is MessageUpdate.Accumulate -> {
+                    performActiveMessageUpdate(lastPendingUpdate.koreanText, lastPendingUpdate.englishText, shouldAccumulate = true)
+                }
+                is MessageUpdate.Replace -> {
+                    performActiveMessageUpdate(lastPendingUpdate.koreanText, lastPendingUpdate.englishText, shouldAccumulate = false)
                 }
             }
-            } // Close activeMessageMutex.withLock
+            // Wait for database write to complete
+            delay(150)
+            Log.d(TAG, "Pending update processed successfully")
         }
+        
+        // FIXED: Ensure translation job completes before finalizing
+        translationJob?.join()
+        
+        // Invalidate cache to ensure fresh data
+        invalidateActiveMessageCache()
+    }
+    
+    /**
+     * Get active message with retry mechanism for reliability
+     */
+    private suspend fun getActiveMessageWithRetry(id: String): TranslationMessage? {
+        repeat(3) { attempt ->
+            try {
+                invalidateActiveMessageCache()
+                val message = translationRepository.getActiveMessage()
+                if (message?.id == id) {
+                    Log.d(TAG, "Retrieved message on attempt ${attempt + 1}")
+                    return message
+                }
+                Log.w(TAG, "Message ID mismatch on attempt ${attempt + 1}: expected $id, got ${message?.id}")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to get message on attempt ${attempt + 1}", e)
+            }
+            
+            if (attempt < 2) delay(100) // Brief delay before retry
+        }
+        
+        Log.e(TAG, "Failed to retrieve message after 3 attempts: $id")
+        return null
+    }
+    
+    /**
+     * Professional logic for determining if message should be deleted
+     * FIXED: Preserve messages with Korean content even if English translation is empty
+     */
+    private fun shouldDeleteMessage(message: TranslationMessage): Boolean {
+        val koreanText = message.originalText.trim()
+        val englishText = message.translatedText.trim()
+        
+        // DEFENSIVE: Never delete if there's ANY Korean content
+        val hasKoreanCharacters = koreanText.any { it in '가'..'힣' }
+        if (hasKoreanCharacters) {
+            Log.d(TAG, "🛡️ PRESERVED: Message contains Korean characters - never delete")
+            return false
+        }
+        
+        // DEFENSIVE: Check if we have backup translation data that should be preserved
+        val hasBackupData = lastSuccessfulTranslation?.let { backup ->
+            backup.koreanText.isNotBlank() || backup.englishText.isNotBlank()
+        } ?: false
+        
+        if (hasBackupData) {
+            Log.d(TAG, "🛡️ PRESERVED: Backup translation data exists - recovering to message")
+            // Attempt to restore from backup
+            lastSuccessfulTranslation?.let { backup ->
+                if (backup.koreanText.isNotBlank() || backup.englishText.isNotBlank()) {
+                    Log.d(TAG, "🔄 RECOVERY: Restoring from backup - Korean: '${backup.koreanText}', English: '${backup.englishText}'")
+                    // Update message with backup content (this will be processed in next retry)
+                    updateActiveMessageWithReplacement(backup.koreanText, backup.englishText)
+                }
+            }
+            return false
+        }
+        
+        // Only delete if BOTH Korean and English are completely empty AND no Korean characters found
+        val shouldDelete = koreanText.isBlank() && englishText.isBlank()
+        
+        if (shouldDelete) {
+            Log.d(TAG, "✅ SAFE TO DELETE: No Korean content, no English content, no backup data")
+        } else {
+            Log.d(TAG, "🛡️ PRESERVED: Contains content - Korean='${koreanText.take(20)}...', English='${englishText.take(20)}...'")
+        }
+        
+        return shouldDelete
+    }
+    
+    /**
+     * Clear message finalizing state
+     */
+    private fun clearMessageFinalizing(messageId: String) {
+        finalizingMessages.remove(messageId)
+        Log.d(TAG, "Cleared finalizing state for: $messageId")
     }
     
     /**
@@ -1173,19 +1219,57 @@ class OptimizedTranslationViewModel @Inject constructor(
     }
     
     /**
-     * Stop recording
+     * Professional stop recording with dynamic completion tracking
      */
     fun stopRecording() {
-        viewModelScope.launch {
-            sonioxStreamingService.stopListening()
-            translationJob?.cancel()
-            // REMOVED: partialTranslationJob?.cancel() - no longer needed
-            activeMessageUpdateJob?.cancel()
-            
-            // Clear continuous mode flag
-            _uiState.update { it.copy(continuousRecordingMode = false) }
-            
-            Log.d(TAG, "Recording stopped")
+        // Cancel any pending finalization
+        finalizationJob?.cancel()
+        
+        finalizationJob = viewModelScope.launch {
+            try {
+                Log.d(TAG, "Professional stop recording initiated")
+                
+                // 1. Update state and stop audio input
+                updateSessionState(SessionState.Processing)
+                sonioxStreamingService.stopListening()
+                _uiState.update { 
+                    it.copy(
+                        isRecording = false,
+                        continuousRecordingMode = false,
+                        systemStatus = "Processing translation..."
+                    ) 
+                }
+                
+                // 2. Wait for pipeline completion with timeout (increased for dual-engine translation)
+                val completed = withTimeoutOrNull(5000) {  // Increased from 2s to 5s for ML Kit + Gemini
+                    waitForPipelineCompletion()
+                } ?: false
+                
+                if (!completed) {
+                    Log.w(TAG, "Pipeline completion timeout - forcing flush")
+                    forceFlushAllPendingOperations()
+                }
+                
+                // 3. Finalize based on recording mode
+                updateSessionState(SessionState.Finalizing)
+                if (_uiState.value.continuousRecordingMode) {
+                    finalizeAndContinue()
+                } else {
+                    finalizeAndStop()
+                }
+                
+                // 4. Handle post-finalization UI
+                handlePostFinalizationUI()
+                
+                Log.d(TAG, "Professional stop recording completed successfully")
+                
+            } catch (e: CancellationException) {
+                Log.d(TAG, "Stop recording cancelled - likely restarted")
+                // Don't reset state on cancellation - new operation will handle it
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during stop recording", e)
+                handleFinalizationError(e)
+            }
         }
     }
     
@@ -1206,6 +1290,235 @@ class OptimizedTranslationViewModel @Inject constructor(
             // Start in continuous mode if not already recording
             startRecording(continuousMode = true)
         }
+    }
+    
+    /**
+     * Thread-safe session state updates with logging
+     */
+    private fun updateSessionState(newState: SessionState) {
+        _uiState.update { it.copy(sessionState = newState) }
+        Log.d(TAG, "State transition: ${_uiState.value.sessionState} → $newState")
+    }
+    
+    /**
+     * Dynamic pipeline completion tracking (no fixed delays)
+     */
+    private suspend fun waitForPipelineCompletion(): Boolean {
+        val startTime = System.currentTimeMillis()
+        var attempts = 0
+        
+        while (attempts < 100) { // 5 seconds max (50ms * 100) - increased for dual-engine processing
+            if (!isAnyOperationPending()) {
+                val duration = System.currentTimeMillis() - startTime
+                Log.d(TAG, "Pipeline completion took ${duration}ms")
+                return true
+            }
+            delay(50)
+            attempts++
+        }
+        
+        Log.w(TAG, "Pipeline completion timeout after 5 seconds")
+        return false
+    }
+    
+    /**
+     * Check if any operations are still pending in the pipeline
+     */
+    private fun isAnyOperationPending(): Boolean {
+        return translationManager.isProcessing() ||
+               hasPendingDatabaseOperations() ||
+               hasPendingTriggerEmissions()
+    }
+    
+    /**
+     * Force flush all pending operations in parallel
+     */
+    private suspend fun forceFlushAllPendingOperations() {
+        Log.d(TAG, "Force flushing all pending operations")
+        
+        coroutineScope {
+            // Parallel flush of all systems for efficiency
+            launch { flushTranslationPipeline() }
+            launch { flushDatabaseOperations() }
+            launch { flushUIUpdates() }
+        }
+        
+        // Brief wait for operations to process
+        delay(200)
+    }
+    
+    /**
+     * Flush translation pipeline with current partial text
+     */
+    private suspend fun flushTranslationPipeline() {
+        _uiState.value.currentPartialText?.let { text ->
+            if (text.isNotBlank()) {
+                Log.d(TAG, "Flushing translation for: '${text.take(30)}...'")
+                translationTrigger.emit(text)
+            }
+        }
+    }
+    
+    /**
+     * Flush pending database operations
+     */
+    private suspend fun flushDatabaseOperations() {
+        activeMessageUpdateTrigger.replayCache.lastOrNull()?.let { update ->
+            Log.d(TAG, "Flushing database update: ${update::class.simpleName}")
+            activeMessageUpdateTrigger.emit(update)
+        }
+    }
+    
+    /**
+     * Flush UI updates
+     */
+    private suspend fun flushUIUpdates() {
+        // Cancel any pending jobs to flush immediately
+        translationJob?.cancel()
+        activeMessageUpdateJob?.cancel()
+    }
+    
+    /**
+     * Finalize and continue (for continuous recording mode)
+     */
+    private suspend fun finalizeAndContinue() {
+        Log.d(TAG, "Finalizing for continuous mode")
+        
+        // Finalize current segment
+        finalizeActiveMessage()
+        
+        // Prepare for next segment immediately
+        currentSegmentNumber++
+        updateSessionState(SessionState.Idle)
+        
+        _uiState.update { 
+            it.copy(
+                systemStatus = "Ready for next segment",
+                isTranslating = false,
+                isEnhancing = false
+            ) 
+        }
+        
+        Log.d(TAG, "Continuous mode: Ready for segment $currentSegmentNumber")
+    }
+    
+    /**
+     * Finalize and stop (for standard recording mode)
+     */
+    private suspend fun finalizeAndStop() {
+        Log.d(TAG, "Finalizing for standard mode")
+        
+        // Full finalization
+        finalizeActiveMessage()
+        
+        // Show completion state
+        val finalText = _uiState.value.currentPartialText ?: ""
+        updateSessionState(SessionState.Completed(finalText, System.currentTimeMillis()))
+        
+        _uiState.update { 
+            it.copy(
+                systemStatus = "Translation completed",
+                isTranslating = false,
+                isEnhancing = false
+            ) 
+        }
+        
+        Log.d(TAG, "Standard mode: Recording completed")
+    }
+    
+    /**
+     * Handle post-finalization UI with smart clearing
+     */
+    private suspend fun handlePostFinalizationUI() {
+        Log.d(TAG, "Handling post-finalization UI")
+        
+        // Only clear UI for standard mode (not continuous)
+        if (!_uiState.value.continuousRecordingMode) {
+            smartClearUI()
+        }
+    }
+    
+    /**
+     * Smart UI clearing with user activity detection
+     */
+    private suspend fun smartClearUI() {
+        val currentSessionState = _uiState.value.sessionState
+        
+        if (currentSessionState !is SessionState.Completed) return
+        
+        val completionTime = currentSessionState.timestamp
+        
+        // Monitor for 2 seconds, but cancel if user starts new action
+        withTimeoutOrNull(2000) {
+            while (true) {
+                val newState = _uiState.value.sessionState
+                
+                // If user started new recording or state changed, don't clear
+                if (newState !is SessionState.Completed || 
+                    newState.timestamp != completionTime) {
+                    Log.d(TAG, "Smart UI clear cancelled - user activity detected")
+                    return@withTimeoutOrNull
+                }
+                
+                delay(100)
+            }
+        }
+        
+        // Clear only if still in same completed state
+        if (_uiState.value.sessionState is SessionState.Completed) {
+            _uiState.update {
+                it.copy(
+                    currentPartialText = null,
+                    currentPartialTranslation = null,
+                    systemStatus = null,
+                    sessionState = SessionState.Idle
+                )
+            }
+            Log.d(TAG, "Smart UI clear completed")
+        }
+    }
+    
+    /**
+     * Handle finalization errors with recovery
+     */
+    private fun handleFinalizationError(e: Exception) {
+        Log.e(TAG, "Finalization error - attempting recovery", e)
+        
+        updateSessionState(SessionState.Error(e.message ?: "Unknown finalization error"))
+        
+        _uiState.update { 
+            it.copy(
+                error = "Recording finalization failed: ${e.message}",
+                isRecording = false,
+                isTranslating = false,
+                isEnhancing = false,
+                systemStatus = null
+            ) 
+        }
+        
+        // Auto-recovery after error
+        viewModelScope.launch {
+            delay(3000) // Show error for 3 seconds
+            if (_uiState.value.sessionState is SessionState.Error) {
+                updateSessionState(SessionState.Idle)
+                _uiState.update { it.copy(error = null) }
+                Log.d(TAG, "Auto-recovery from finalization error completed")
+            }
+        }
+    }
+    
+    /**
+     * Check for pending database operations
+     */
+    private fun hasPendingDatabaseOperations(): Boolean {
+        return activeMessageUpdateTrigger.replayCache.isNotEmpty()
+    }
+    
+    /**
+     * Check for pending trigger emissions
+     */
+    private fun hasPendingTriggerEmissions(): Boolean {
+        return translationTrigger.subscriptionCount.value > 0
     }
     
     /**
@@ -1651,10 +1964,13 @@ class OptimizedTranslationViewModel @Inject constructor(
     
     override fun onCleared() {
         super.onCleared()
+        
+        // Cancel all jobs for clean lifecycle management
         translationJob?.cancel()
-        // REMOVED: partialTranslationJob?.cancel() - no longer needed
         activeMessageUpdateJob?.cancel()
-        Log.d(TAG, "OptimizedTranslationViewModel cleared")
+        finalizationJob?.cancel() // Cancel professional finalization
+        
+        Log.d(TAG, "OptimizedTranslationViewModel cleared - all jobs cancelled")
         Log.i(TAG, getDetailedStatistics())
     }
 }
