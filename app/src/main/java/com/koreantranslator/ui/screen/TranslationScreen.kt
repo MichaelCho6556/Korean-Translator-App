@@ -99,18 +99,24 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
         ) {
             items(uiState.messages) { message -> MessageBubble(message = message) }
 
-            // Show system status and real-time partial text with proper state transitions
-            // Keep accumulated text visible after recording stops
-            if (uiState.systemStatus != null || uiState.currentPartialText != null) {
-                item {
-                    // IMPROVED: Better state-aware display logic
-                    val activeMessageInfo = remember(uiState.systemStatus, uiState.currentPartialText, uiState.isRecording, uiState.isTranslating, uiState.isEnhancing) {
-                        when {
-                            uiState.systemStatus != null -> Triple(uiState.systemStatus, true, true)
-                            uiState.currentPartialText != null -> Triple(uiState.currentPartialText, false, true)
-                            else -> Triple(null, false, false)
+            // Show active message box - SIMPLIFIED: Show when there's accumulated or partial text
+            val hasText = uiState.accumulatedKoreanText.isNotBlank() || 
+                         uiState.currentPartialText?.isNotBlank() == true || 
+                         uiState.systemStatus != null
+            if (hasText) {
+                item(key = "active_message_box") {
+                    // DISPLAY: Combined accumulated text + current partial text
+                    val koreanText = buildString {
+                        if (uiState.accumulatedKoreanText.isNotBlank()) {
+                            append(uiState.accumulatedKoreanText)
+                        }
+                        if (uiState.currentPartialText?.isNotBlank() == true) {
+                            if (uiState.accumulatedKoreanText.isNotBlank()) append(" ")
+                            append(uiState.currentPartialText)
                         }
                     }
+                    val displayText = uiState.systemStatus ?: koreanText
+                    val isSystemStatus = uiState.systemStatus != null
                     Card(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                             colors =
@@ -122,9 +128,6 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                             border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
                     ) {
                         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                            val displayText = activeMessageInfo.first
-                            val isSystemStatus = activeMessageInfo.second
-                            
                             Row(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -140,43 +143,12 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                                             color = MaterialTheme.colorScheme.primary
                                     )
                                 } else {
-                                    // PROFESSIONAL: Use SessionState for accurate status display
-                                    val (statusIcon, statusText, statusColor) = when (uiState.sessionState) {
-                                        is SessionState.Recording -> Triple(
-                                            Icons.Default.Mic, 
-                                            if (uiState.isAccumulatingMessage) "Accumulating..." else "Listening...", 
-                                            MaterialTheme.colorScheme.primary
-                                        )
-                                        is SessionState.Processing -> Triple(
-                                            Icons.Default.Psychology, 
-                                            "Processing translation...", 
-                                            MaterialTheme.colorScheme.secondary
-                                        )
-                                        is SessionState.Finalizing -> Triple(
-                                            Icons.Default.Psychology, 
-                                            "Saving message...", 
-                                            MaterialTheme.colorScheme.secondary
-                                        )
-                                        is SessionState.Completed -> Triple(
-                                            Icons.Default.MicOff, 
-                                            "Completed", 
-                                            MaterialTheme.colorScheme.tertiary
-                                        )
-                                        is SessionState.Error -> Triple(
-                                            Icons.Default.MicOff, 
-                                            "Error", 
-                                            MaterialTheme.colorScheme.error
-                                        )
-                                        is SessionState.Idle -> {
-                                            // Fallback to boolean logic for backward compatibility
-                                            when {
-                                                uiState.isRecording -> Triple(Icons.Default.Mic, "Listening...", MaterialTheme.colorScheme.primary)
-                                                uiState.isTranslating || uiState.isEnhancing -> Triple(Icons.Default.Psychology, "Processing...", MaterialTheme.colorScheme.secondary)
-                                                uiState.currentPartialText != null -> Triple(Icons.Default.MicOff, "Ready", MaterialTheme.colorScheme.tertiary)
-                                                else -> Triple(Icons.Default.Mic, "Ready", MaterialTheme.colorScheme.onSurfaceVariant)
-                                            }
-                                        }
-                                    }
+                                    // SIMPLIFIED: Stable status display based only on text presence
+                                    val (statusIcon, statusText, statusColor) = Triple(
+                                        Icons.Default.Mic, 
+                                        "Speaking...", 
+                                        MaterialTheme.colorScheme.primary
+                                    )
                                     Icon(
                                             statusIcon,
                                             contentDescription = statusText,
@@ -188,28 +160,34 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                                             style = MaterialTheme.typography.labelSmall,
                                             color = statusColor
                                     )
-                                    // Show accumulation indicator
-                                    if (uiState.isAccumulatingMessage) {
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                                text = "📝",
-                                                style = MaterialTheme.typography.labelSmall
-                                        )
-                                    }
                                 }
                             }
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                    text = displayText ?: "Ready to listen",
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    fontWeight = FontWeight.Medium
-                            )
-                            // Only show partial translation for actual speech (not system status)
+                            
+                            // STABILIZED: Display text content with fallback
+                            if (displayText?.isNotBlank() == true) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                        text = displayText,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = FontWeight.Medium
+                                )
+                            }
+                            
+                            // Show accumulated English translation + current partial translation
                             if (!isSystemStatus) {
-                                uiState.currentPartialTranslation?.let { partialTranslation ->
+                                val englishText = buildString {
+                                    if (uiState.accumulatedEnglishText.isNotBlank()) {
+                                        append(uiState.accumulatedEnglishText)
+                                    }
+                                    if (uiState.currentPartialTranslation?.isNotBlank() == true) {
+                                        if (uiState.accumulatedEnglishText.isNotBlank()) append(" ")
+                                        append(uiState.currentPartialTranslation)
+                                    }
+                                }
+                                if (englishText.isNotBlank()) {
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
-                                            text = partialTranslation,
+                                            text = englishText,
                                             style = MaterialTheme.typography.bodyMedium,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -301,6 +279,25 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                     horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically
             ) {
+                // Clear Text button (SIMPLIFIED - manual control only)
+                if ((uiState.currentPartialText != null || uiState.isAccumulatingMessage) && !uiState.isRecording) {
+                    OutlinedButton(
+                            onClick = { viewModel.clearAllText() },
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.secondary
+                            )
+                    ) {
+                        Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = "Clear Text",
+                                modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Clear Text")
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                }
+                
                 // New Message button (only show when accumulating)
                 if (uiState.isAccumulatingMessage && !uiState.isRecording) {
                     OutlinedButton(
