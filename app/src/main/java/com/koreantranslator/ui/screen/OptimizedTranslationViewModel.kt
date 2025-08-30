@@ -90,9 +90,9 @@ class OptimizedTranslationViewModel @Inject constructor(
         private const val MAX_TRANSLATION_ATTEMPTS = 2
         private const val MIN_MESSAGE_LENGTH = 1  // Minimum characters for message creation (reduced for Korean)
         
-        // Message accumulation settings
-        private const val SESSION_TIMEOUT_MS = 30_000L  // 30 seconds to continue accumulating
-        private const val MAX_ACCUMULATED_LENGTH = 1000  // Max chars per accumulated message
+        // Message accumulation settings (SIMPLIFIED - no limits)
+        // REMOVED: SESSION_TIMEOUT_MS - no timeout, accumulate indefinitely
+        // REMOVED: MAX_ACCUMULATED_LENGTH - no length limit, user controls via Clear button
         
         // Active message caching
         private const val CACHE_VALIDITY_MS = 500L
@@ -114,8 +114,10 @@ class OptimizedTranslationViewModel @Inject constructor(
         val isLoading: Boolean = false, // Derived from isTranslating || isEnhancing
         val continuousRecordingMode: Boolean = false, // For extended recording sessions
         val sessionStatistics: SessionStatistics = SessionStatistics(),
-        val isAccumulatingMessage: Boolean = false, // Whether currently accumulating to existing message
-        val accumulationSessionTimeout: Long = SESSION_TIMEOUT_MS
+        val isAccumulatingMessage: Boolean = false, // Whether currently accumulating to existing message (no timeout)
+        // NEW: Separate accumulated text that persists across Soniox partial text resets
+        val accumulatedKoreanText: String = "",
+        val accumulatedEnglishText: String = ""
     )
     
     data class SessionStatistics(
@@ -205,28 +207,30 @@ class OptimizedTranslationViewModel @Inject constructor(
     }
     
     /**
-     * Observe Soniox speech recognition results
+     * Observe Soniox speech recognition results - SIMPLIFIED
      */
     private fun observeSpeechRecognition() {
         viewModelScope.launch {
-            // Listen to recognized text from Soniox (now with sentence accumulation)
+            // SIMPLIFIED: Accept all recognized text, no filtering
             sonioxStreamingService.recognizedText
                 .filterNotNull()
-                .filter { it.isNotBlank() && it.length >= SentenceDetectionConstants.MIN_SENTENCE_LENGTH }
-                .filter { recognizedText -> 
-                    // ENHANCED: Validate sentence completeness before translation
-                    val isCompleteSentence = isValidSentenceForTranslation(recognizedText)
-                    if (!isCompleteSentence) {
-                        Log.d(TAG, "Skipping translation for incomplete sentence: '$recognizedText'")
-                    }
-                    isCompleteSentence
-                }
+                .filter { it.isNotBlank() }
                 .collect { rawRecognizedText ->
-                    Log.d(TAG, "Complete sentence received for translation: '${rawRecognizedText.take(50)}...'")
+                    Log.d(TAG, "Text received for translation: '${rawRecognizedText.take(50)}...'")
                     
-                    // FIXED: Process Korean text through NLP service for proper spacing
+                    // Process Korean text through NLP service for proper spacing
                     val processedKoreanText = koreanNLPService.process(rawRecognizedText.trim())
                     Log.d(TAG, "Korean NLP processed: '${rawRecognizedText.trim()}' -> '$processedKoreanText'")
+                    
+                    // APPEND to accumulated Korean text (separate from Soniox partial text)
+                    _uiState.update { currentState ->
+                        val newAccumulated = if (currentState.accumulatedKoreanText.isBlank()) {
+                            processedKoreanText
+                        } else {
+                            "${currentState.accumulatedKoreanText} $processedKoreanText"
+                        }
+                        currentState.copy(accumulatedKoreanText = newAccumulated)
+                    }
                     
                     // CRITICAL BACKUP: Immediately create backup when Korean text is recognized
                     // This ensures Korean text is never lost, even if translation fails
@@ -253,7 +257,7 @@ class OptimizedTranslationViewModel @Inject constructor(
                         translationTrigger.emit(processedKoreanText)
                     }
                     
-                    Log.d(TAG, "Translating NEW sentence only: '$processedKoreanText'")
+                    Log.d(TAG, "Translating text: '$processedKoreanText'")
                     if (_uiState.value.isAccumulatingMessage) {
                         Log.d(TAG, "Will accumulate this translation result to existing message")
                     } else {
@@ -263,43 +267,53 @@ class OptimizedTranslationViewModel @Inject constructor(
         }
         
         viewModelScope.launch {
-            // Listen to partial text for UI DISPLAY ONLY - no database writes
-            sonioxStreamingService.partialText.collect { partialText ->
-                // FIXED: Only update UI state, no database operations for partial text
-                _uiState.update { it.copy(currentPartialText = partialText) }
-                
-                // OPTIMIZED: Reduced logging spam with filtering
-                if (!partialText.isNullOrEmpty() && partialText.length > 2) {
-                    Log.d(TAG, "Real-time partial text (UI only): '${partialText.take(30)}...'")
+            // Listen to partial text - just update UI, don't append partial text
+            sonioxStreamingService.partialText
+                .debounce(100L) // Brief debounce to prevent excessive updates
+                .collect { partialText ->
+                    // Just show current partial text in UI
+                    _uiState.update { it.copy(currentPartialText = partialText) }
+                    
+                    if (!partialText.isNullOrEmpty() && partialText.length > 2) {
+                        Log.d(TAG, "Partial text update: '${partialText.take(30)}...'")
+                    }
                 }
-                
-                // Note: Partial text is now UI-only - database updates only happen 
-                // when complete sentences arrive via the recognized text flow
-            }
         }
         
         viewModelScope.launch {
-            // Listen to recording state
-            sonioxStreamingService.isListening.collect { isListening ->
-                _uiState.update { it.copy(isRecording = isListening) }
-                
-                if (isListening) {
-                    // Create or continue accumulating active message when recording starts
-                    createOrContinueActiveMessage()
-                    Log.d(TAG, "Recording started - created or continued active message")
-                } else {
-                    // CRITICAL FIX: Don't auto-finalize here - let professional stopRecording() handle it
-                    // This prevents double finalization race condition
-                    Log.d(TAG, "Recording stopped - finalization will be handled by stopRecording()")
+            // Listen to recording state with optimization to prevent unnecessary updates
+            sonioxStreamingService.isListening
+                .collect { isListening ->
+                    val previousState = _uiState.value.isRecording
+                    
+                    // PERFORMANCE: Only update if state actually changed
+                    if (previousState != isListening) {
+                        _uiState.update { it.copy(isRecording = isListening) }
+                        
+                        if (isListening) {
+                            // Create or continue accumulating active message when recording starts
+                            createOrContinueActiveMessage()
+                            Log.d(TAG, "Recording started - created or continued active message")
+                        } else {
+                            // CRITICAL FIX: Don't auto-finalize here - let professional stopRecording() handle it
+                            // This prevents double finalization race condition
+                            Log.d(TAG, "Recording stopped - finalization will be handled by stopRecording()")
+                        }
+                    } else {
+                        Log.d(TAG, "Recording state update skipped - no change: $isListening")
+                    }
                 }
-            }
         }
         
         viewModelScope.launch {
-            // Listen to system status (connection status separate from speech)
-            sonioxStreamingService.systemStatus.collect { systemStatus ->
-                _uiState.update { it.copy(systemStatus = systemStatus) }
-            }
+            // Listen to system status with debouncing to reduce UI flickering
+            sonioxStreamingService.systemStatus
+                .debounce(200L) // STABILITY: 200ms debounce for system status updates
+                .distinctUntilChanged() // PERFORMANCE: Only update when status actually changes
+                .collect { systemStatus ->
+                    _uiState.update { it.copy(systemStatus = systemStatus) }
+                    Log.d(TAG, "System status updated: $systemStatus")
+                }
         }
     }
     
@@ -362,8 +376,14 @@ class OptimizedTranslationViewModel @Inject constructor(
                             isEnhancing = isEnhancing,
                             isLoading = isTranslating || isEnhancing,
                             error = if (state is TranslationState.Error) state.message else null,
-                            currentPartialTranslation = if (state is TranslationState.Success && state.isPartial) 
-                                state.translatedText else currentState.currentPartialTranslation
+                            accumulatedEnglishText = if (state is TranslationState.Success && !state.isPartial) {
+                                // APPEND translation to accumulated English text
+                                if (currentState.accumulatedEnglishText.isBlank()) {
+                                    state.translatedText
+                                } else {
+                                    "${currentState.accumulatedEnglishText} ${state.translatedText}"
+                                }
+                            } else currentState.accumulatedEnglishText
                         )
                     }
                     
@@ -485,48 +505,14 @@ class OptimizedTranslationViewModel @Inject constructor(
                               "hasActiveMessage=${stateSnapshot.hasActiveMessage}, shouldAccumulate=${stateSnapshot.shouldAccumulate}")
                     
                     if (stateSnapshot.shouldAccumulate) {
-                        // ENHANCED DUPLICATE PREVENTION: Multi-level checks to prevent text duplication
-                    val activeMessage = getActiveMessageSafe()
-                    val existingKoreanText = activeMessage?.originalText ?: ""
-                    val cleanStateText = state.originalText.replace("...", "").trim()
-                    
-                    // Level 1: Exact text comparison
-                    val isDuplicateExact = existingKoreanText.contains(cleanStateText)
-                    
-                    // Level 2: Fuzzy matching for near-duplicates (check last 3 words overlap)
-                    val existingWords = existingKoreanText.split(" ").takeLast(3)
-                    val newWords = cleanStateText.split(" ").take(3)
-                    val hasWordOverlap = existingWords.intersect(newWords.toSet()).size >= 2
-                    
-                    // Level 3: Check if text ends with new content
-                    val endsWithNewText = existingKoreanText.endsWith(cleanStateText)
-                    
-                    val isDuplicate = isDuplicateExact || endsWithNewText || (hasWordOverlap && existingKoreanText.isNotEmpty())
-                    
-                    // Only accumulate if not a duplicate
-                    if (!isDuplicate) {
-                        // ACCUMULATE: Add new translation to existing message content
+                        // SIMPLIFIED: Just accumulate the text - no duplicate checks
                         appendToActiveMessage(
-                            koreanText = state.originalText,  // New sentence only
-                            englishText = state.translatedText // New translation only
+                            koreanText = state.originalText,
+                            englishText = state.translatedText
                         )
-                        Log.d(TAG, "✅ ACCUMULATED translation using atomic state validation: ${state.engine.name} (${(state.confidence * 100).toInt()}%)")
-                        Log.d(TAG, "   NEW Korean: '${state.originalText}'")
-                        Log.d(TAG, "   NEW English: '${state.translatedText}'")
-                    } else {
-                        // Enhanced duplicate reporting
-                        val duplicateType = when {
-                            isDuplicateExact -> "EXACT_MATCH"
-                            endsWithNewText -> "ENDS_WITH_TEXT"
-                            hasWordOverlap -> "WORD_OVERLAP"
-                            else -> "UNKNOWN"
-                        }
-                        
-                        Log.d(TAG, "⏩ SKIPPED duplicate accumulation - $duplicateType detected")
-                        Log.d(TAG, "   Existing: '...${existingKoreanText.takeLast(50)}'")
-                        Log.d(TAG, "   Attempted: '${cleanStateText}'")
-                        Log.d(TAG, "   Word overlap: ${existingWords.intersect(newWords.toSet()).size}/2 minimum required")
-                    }
+                        Log.d(TAG, "✅ ACCUMULATED translation: ${state.engine.name} (${(state.confidence * 100).toInt()}%)")
+                        Log.d(TAG, "   Korean: '${state.originalText}'")
+                        Log.d(TAG, "   English: '${state.translatedText}'")
                 } else {
                     // REPLACE: First message or non-accumulating mode
                     updateActiveMessageWithReplacement(
@@ -565,34 +551,26 @@ class OptimizedTranslationViewModel @Inject constructor(
                     return@launch
                 }
                 
-                // FIXED: Check if we should continue accumulating to the ACTIVE message (not just most recent)
-                // This prevents checking old inactive messages and getting huge time gaps
+                // FIXED: Check if we should continue accumulating to existing messages 
+                // Allow unlimited pause duration for seamless conversation accumulation
                 val activeMessage = translationRepository.getActiveMessage()
-                val currentTime = System.currentTimeMillis()
                 
                 if (activeMessage != null) {
-                    val timeSinceLastMessage = currentTime - activeMessage.timestamp.time
                     // RACE CONDITION FIX: Check atomic finalization tracking
                     val isMessageBeingFinalized = isMessageFinalizing(activeMessage.id)
-                    // ENHANCED: Extend accumulation timeout during active recording sessions
-                    val isActivelyRecording = _uiState.value.isRecording
-                    val extendedTimeout = if (isActivelyRecording) {
-                        SESSION_TIMEOUT_MS * 2 // Double timeout during active recording (60 seconds)
-                    } else {
-                        SESSION_TIMEOUT_MS // Normal timeout (30 seconds)
-                    }
                     
-                    val canAccumulate = timeSinceLastMessage < extendedTimeout &&
-                                       activeMessage.originalText.length < MAX_ACCUMULATED_LENGTH &&
-                                       activeMessage.conversationId == currentConversationId &&
-                                       !activeMessage.isActive &&
+                    // SIMPLIFIED: Always accumulate - no length limits or timeouts
+                    // Only check that it's not being finalized and same conversation
+                    val canAccumulate = activeMessage.conversationId == currentConversationId &&
                                        !isMessageBeingFinalized
-                                       
-                    if (isActivelyRecording) {
-                        Log.d(TAG, "🎙️ Active recording - using extended accumulation timeout: ${extendedTimeout}ms")
-                    }
                     
-                    if (canAccumulate && !isMessageBeingFinalized) {
+                    Log.d(TAG, "Accumulation eligibility check (SIMPLIFIED):")
+                    Log.d(TAG, "  - Message length: ${activeMessage.originalText.length} chars (no limit)")
+                    Log.d(TAG, "  - Same conversation: ${activeMessage.conversationId == currentConversationId}")
+                    Log.d(TAG, "  - Not being finalized: ${!isMessageBeingFinalized}")
+                    Log.d(TAG, "  - Can accumulate: $canAccumulate")
+                                       
+                    if (canAccumulate) {
                         // ATOMIC STATE TRANSITION: Eliminate race condition by making database state authoritative
                         Log.d(TAG, "🔒 ATOMIC: Beginning atomic accumulation state transition")
                         
@@ -607,8 +585,8 @@ class OptimizedTranslationViewModel @Inject constructor(
                             
                             Log.d(TAG, "✅ ATOMIC SUCCESS: Database and UI state now consistent")
                             Log.d(TAG, "   Message ID: ${activeMessage.id}")
-                            Log.d(TAG, "   Time since last: ${timeSinceLastMessage}ms")
                             Log.d(TAG, "   Message length: ${activeMessage.originalText.length} chars")
+                            Log.d(TAG, "   Unlimited accumulation enabled - no time limits")
                             
                             trackAccumulationMetrics("ATOMIC_TRANSITION", true, stateMismatch = false)
                             return@launch
@@ -628,7 +606,7 @@ class OptimizedTranslationViewModel @Inject constructor(
                         createNewActiveMessage()
                         return@launch
                     } else {
-                        Log.d(TAG, "Cannot accumulate - time gap: ${timeSinceLastMessage}ms, length: ${activeMessage.originalText.length}, isActive: ${activeMessage.isActive}")
+                        Log.d(TAG, "Cannot accumulate - different conversation: ${activeMessage.conversationId != currentConversationId}, being finalized: ${isMessageBeingFinalized}")
                     }
                 }
                 
@@ -1166,13 +1144,15 @@ class OptimizedTranslationViewModel @Inject constructor(
     }
     
     /**
-     * Load existing messages from database
+     * Load existing messages from database with optimization to prevent unnecessary UI updates
      */
     private fun loadMessages() {
         viewModelScope.launch {
-            translationRepository.getAllMessages().collect { messages ->
-                _uiState.update { it.copy(messages = messages) }
-            }
+            translationRepository.getAllMessages()
+                .distinctUntilChanged() // PERFORMANCE: Prevent identical emissions
+                .collect { messages ->
+                    _uiState.update { it.copy(messages = messages) }
+                }
         }
     }
     
@@ -1187,8 +1167,14 @@ class OptimizedTranslationViewModel @Inject constructor(
     fun startRecording(continuousMode: Boolean = false) {
         viewModelScope.launch {
             try {
-                // Only reset active message for new recording session (preserve conversation)
-                currentActiveMessageId = null
+                // FIXED: Don't reset active message ID - preserve it for accumulation
+                // Only reset if explicitly starting a new conversation
+                val preservingActiveMessage = currentActiveMessageId != null
+                if (preservingActiveMessage) {
+                    Log.d(TAG, "Preserving active message ID for accumulation: $currentActiveMessageId")
+                } else {
+                    Log.d(TAG, "No active message ID to preserve - will create or find message to accumulate to")
+                }
                 
                 Log.d(TAG, "Starting recording - continuous mode: $continuousMode")
                 Log.d(TAG, "Continuing conversation ID: $currentConversationId")
@@ -1293,11 +1279,18 @@ class OptimizedTranslationViewModel @Inject constructor(
     }
     
     /**
-     * Thread-safe session state updates with logging
+     * Thread-safe session state updates with logging and stability optimization
      */
     private fun updateSessionState(newState: SessionState) {
-        _uiState.update { it.copy(sessionState = newState) }
-        Log.d(TAG, "State transition: ${_uiState.value.sessionState} → $newState")
+        val currentState = _uiState.value.sessionState
+        
+        // STABILITY: Only update if state actually changes to prevent unnecessary recomposition
+        if (currentState::class != newState::class) {
+            _uiState.update { it.copy(sessionState = newState) }
+            Log.d(TAG, "State transition: ${currentState::class.simpleName} → ${newState::class.simpleName}")
+        } else {
+            Log.d(TAG, "State update skipped - same state type: ${currentState::class.simpleName}")
+        }
     }
     
     /**
@@ -1403,79 +1396,61 @@ class OptimizedTranslationViewModel @Inject constructor(
     }
     
     /**
-     * Finalize and stop (for standard recording mode)
+     * Stop recording but keep text visible for accumulation (NEVER AUTO-CLEAR)
      */
     private suspend fun finalizeAndStop() {
-        Log.d(TAG, "Finalizing for standard mode")
+        Log.d(TAG, "Stopping recording - keeping text visible for accumulation")
         
-        // Full finalization
-        finalizeActiveMessage()
-        
-        // Show completion state
+        // SIMPLIFIED: Just stop recording, don't clear ANYTHING
         val finalText = _uiState.value.currentPartialText ?: ""
         updateSessionState(SessionState.Completed(finalText, System.currentTimeMillis()))
         
+        // NEVER CLEAR TEXT - keep everything visible for user control
         _uiState.update { 
             it.copy(
-                systemStatus = "Translation completed",
+                // Keep the text visible! NO CLEARING!
+                // currentPartialText = keep as is (don't clear)
+                // currentPartialTranslation = keep as is (don't clear)
+                systemStatus = null,  // Clear only the system status
                 isTranslating = false,
-                isEnhancing = false
+                isEnhancing = false,
+                isAccumulatingMessage = true  // Always ready to accumulate
             ) 
         }
         
-        Log.d(TAG, "Standard mode: Recording completed")
+        Log.d(TAG, "Recording stopped, text preserved for continued use")
+        Log.d(TAG, "Active message ID preserved: $currentActiveMessageId")
     }
     
     /**
-     * Handle post-finalization UI with smart clearing
+     * Handle post-finalization UI (SIMPLIFIED - no smart clearing)
      */
     private suspend fun handlePostFinalizationUI() {
-        Log.d(TAG, "Handling post-finalization UI")
+        Log.d(TAG, "Handling post-finalization UI - no smart clearing needed")
         
-        // Only clear UI for standard mode (not continuous)
-        if (!_uiState.value.continuousRecordingMode) {
-            smartClearUI()
-        }
+        // SIMPLIFIED: No smart clearing, no delays, no automatic UI clearing
+        // Text remains visible for user control
     }
     
     /**
-     * Smart UI clearing with user activity detection
+     * Manual clear function - ONLY way to clear text (user controlled)
      */
-    private suspend fun smartClearUI() {
-        val currentSessionState = _uiState.value.sessionState
-        
-        if (currentSessionState !is SessionState.Completed) return
-        
-        val completionTime = currentSessionState.timestamp
-        
-        // Monitor for 2 seconds, but cancel if user starts new action
-        withTimeoutOrNull(2000) {
-            while (true) {
-                val newState = _uiState.value.sessionState
-                
-                // If user started new recording or state changed, don't clear
-                if (newState !is SessionState.Completed || 
-                    newState.timestamp != completionTime) {
-                    Log.d(TAG, "Smart UI clear cancelled - user activity detected")
-                    return@withTimeoutOrNull
-                }
-                
-                delay(100)
-            }
+    fun clearAllText() {
+        _uiState.update {
+            it.copy(
+                currentPartialText = null,
+                currentPartialTranslation = null,
+                systemStatus = null,
+                isAccumulatingMessage = false,
+                sessionState = SessionState.Idle,
+                accumulatedKoreanText = "",
+                accumulatedEnglishText = ""
+            )
         }
+        // Clear active message tracking
+        currentActiveMessageId = null
         
-        // Clear only if still in same completed state
-        if (_uiState.value.sessionState is SessionState.Completed) {
-            _uiState.update {
-                it.copy(
-                    currentPartialText = null,
-                    currentPartialTranslation = null,
-                    systemStatus = null,
-                    sessionState = SessionState.Idle
-                )
-            }
-            Log.d(TAG, "Smart UI clear completed")
-        }
+        Log.d(TAG, "User manually cleared all text - fresh start")
     }
     
     /**
@@ -1704,12 +1679,41 @@ class OptimizedTranslationViewModel @Inject constructor(
     }
     
     /**
-     * Clear all messages
+     * Clear all messages - this is an EXPLICIT user action that finalizes any active message
      */
     fun clearAllMessages() {
         viewModelScope.launch {
-            translationRepository.clearAllMessages()
-            translationManager.clearSession()
+            try {
+                Log.d(TAG, "User explicitly requested to clear all messages")
+                
+                // Finalize any active message before clearing all messages
+                if (currentActiveMessageId != null) {
+                    Log.d(TAG, "Finalizing active message before clearing all messages")
+                    finalizeActiveMessage()
+                }
+                
+                // Clear database and session
+                translationRepository.clearAllMessages()
+                translationManager.clearSession()
+                
+                // Reset all state
+                currentActiveMessageId = null
+                _uiState.update {
+                    it.copy(
+                        isAccumulatingMessage = false,
+                        systemStatus = "All messages cleared",
+                        currentPartialText = null,
+                        currentPartialTranslation = null,
+                        error = null
+                    )
+                }
+                
+                Log.d(TAG, "All messages cleared successfully")
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to clear all messages", e)
+                handleTranslationError("", e)
+            }
         }
     }
     
@@ -1722,53 +1726,78 @@ class OptimizedTranslationViewModel @Inject constructor(
     
     /**
      * Force start a new message, breaking current accumulation if active
+     * This is the ONLY time we finalize a message outside of explicit conversation clearing
      */
     fun forceNewMessage() {
         viewModelScope.launch {
             try {
+                Log.d(TAG, "User explicitly requested new message")
+                
                 // If we have an active message, finalize it first
                 if (currentActiveMessageId != null) {
+                    Log.d(TAG, "Finalizing current active message before starting new one")
                     finalizeActiveMessage()
+                } else {
+                    Log.d(TAG, "No active message to finalize")
                 }
                 
                 // Reset accumulation state but preserve visible text
                 _uiState.update { 
                     it.copy(
-                        isAccumulatingMessage = false
+                        isAccumulatingMessage = false,
+                        systemStatus = "Starting new message..."
                         // KEEP: currentPartialText and currentPartialTranslation visible
                     ) 
                 }
                 
-                Log.d(TAG, "Forced new message - accumulation reset")
+                Log.d(TAG, "New message ready - accumulation reset")
                 
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to force new message", e)
+                handleTranslationError("", e)
             }
         }
     }
 
     /**
      * Clear current conversation and start new one
+     * This is an EXPLICIT user action that finalizes the current message
      */
     fun clearConversation() {
         viewModelScope.launch {
-            // Start a new conversation - this is the ONLY place where new conversation ID is created
-            currentConversationId = UUID.randomUUID().toString()
-            currentSegmentNumber = 0
-            currentActiveMessageId = null
-            
-            Log.d(TAG, "New conversation started with ID: $currentConversationId")
-            
-            translationManager.clearSession()
-            // Clear UI state for new conversation
-            _uiState.update { 
-                it.copy(
-                    currentPartialText = null, 
-                    currentPartialTranslation = null,
-                    error = null,
-                    isLoading = false,
-                    isAccumulatingMessage = false // Reset accumulation for new conversation
-                ) 
+            try {
+                Log.d(TAG, "User explicitly requested new conversation")
+                
+                // Finalize any active message before clearing conversation
+                if (currentActiveMessageId != null) {
+                    Log.d(TAG, "Finalizing active message before clearing conversation")
+                    finalizeActiveMessage()
+                }
+                
+                // Start a new conversation - this is the ONLY place where new conversation ID is created
+                val newConversationId = UUID.randomUUID().toString()
+                currentConversationId = newConversationId
+                currentSegmentNumber = 0
+                currentActiveMessageId = null
+                
+                Log.d(TAG, "New conversation started with ID: $newConversationId")
+                
+                translationManager.clearSession()
+                // Clear UI state for new conversation
+                _uiState.update { 
+                    it.copy(
+                        currentPartialText = null, 
+                        currentPartialTranslation = null,
+                        error = null,
+                        isLoading = false,
+                        isAccumulatingMessage = false, // Reset accumulation for new conversation
+                        systemStatus = "New conversation started"
+                    ) 
+                }
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to clear conversation", e)
+                handleTranslationError("", e)
             }
         }
     }

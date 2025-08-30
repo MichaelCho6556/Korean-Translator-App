@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Include Room database in backup -->
+    <include domain="database" path="korean_translator_database"/>
+    
+    <!-- Exclude sensitive files -->
+    <exclude domain="sharedpref" path="device_prefs.xml"/>
+</full-backup-content>
