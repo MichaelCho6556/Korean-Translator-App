@@ -107,7 +107,6 @@ class OptimizedTranslationViewModel @Inject constructor(
         val isEnhancing: Boolean = false,
         val currentPartialText: String? = null,
         val currentPartialTranslation: String? = null, // For UI compatibility
-        val systemStatus: String? = null, // System connection status (separate from speech)
         val currentTranslationState: TranslationState = TranslationState.Idle,
         val error: String? = null,
         val isOnline: Boolean = true,
@@ -305,16 +304,6 @@ class OptimizedTranslationViewModel @Inject constructor(
                 }
         }
         
-        viewModelScope.launch {
-            // Listen to system status with debouncing to reduce UI flickering
-            sonioxStreamingService.systemStatus
-                .debounce(200L) // STABILITY: 200ms debounce for system status updates
-                .distinctUntilChanged() // PERFORMANCE: Only update when status actually changes
-                .collect { systemStatus ->
-                    _uiState.update { it.copy(systemStatus = systemStatus) }
-                    Log.d(TAG, "System status updated: $systemStatus")
-                }
-        }
     }
     
     /**
@@ -1221,8 +1210,7 @@ class OptimizedTranslationViewModel @Inject constructor(
                 _uiState.update { 
                     it.copy(
                         isRecording = false,
-                        continuousRecordingMode = false,
-                        systemStatus = "Processing translation..."
+                        continuousRecordingMode = false
                     ) 
                 }
                 
@@ -1386,7 +1374,6 @@ class OptimizedTranslationViewModel @Inject constructor(
         
         _uiState.update { 
             it.copy(
-                systemStatus = "Ready for next segment",
                 isTranslating = false,
                 isEnhancing = false
             ) 
@@ -1411,7 +1398,6 @@ class OptimizedTranslationViewModel @Inject constructor(
                 // Keep the text visible! NO CLEARING!
                 // currentPartialText = keep as is (don't clear)
                 // currentPartialTranslation = keep as is (don't clear)
-                systemStatus = null,  // Clear only the system status
                 isTranslating = false,
                 isEnhancing = false,
                 isAccumulatingMessage = true  // Always ready to accumulate
@@ -1440,7 +1426,6 @@ class OptimizedTranslationViewModel @Inject constructor(
             it.copy(
                 currentPartialText = null,
                 currentPartialTranslation = null,
-                systemStatus = null,
                 isAccumulatingMessage = false,
                 sessionState = SessionState.Idle,
                 accumulatedKoreanText = "",
@@ -1467,7 +1452,6 @@ class OptimizedTranslationViewModel @Inject constructor(
                 isRecording = false,
                 isTranslating = false,
                 isEnhancing = false,
-                systemStatus = null
             ) 
         }
         
@@ -1701,7 +1685,6 @@ class OptimizedTranslationViewModel @Inject constructor(
                 _uiState.update {
                     it.copy(
                         isAccumulatingMessage = false,
-                        systemStatus = "All messages cleared",
                         currentPartialText = null,
                         currentPartialTranslation = null,
                         error = null
@@ -1745,7 +1728,6 @@ class OptimizedTranslationViewModel @Inject constructor(
                 _uiState.update { 
                     it.copy(
                         isAccumulatingMessage = false,
-                        systemStatus = "Starting new message..."
                         // KEEP: currentPartialText and currentPartialTranslation visible
                     ) 
                 }
@@ -1791,7 +1773,6 @@ class OptimizedTranslationViewModel @Inject constructor(
                         error = null,
                         isLoading = false,
                         isAccumulatingMessage = false, // Reset accumulation for new conversation
-                        systemStatus = "New conversation started"
                     ) 
                 }
                 

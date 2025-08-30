@@ -84,38 +84,14 @@ fun MessageBubble(
                 .fillMaxWidth()
                 .padding(16.dp)
         ) {
-            // Active message indicator
-            if (isActiveMessage) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.FiberManualRecord,
-                        contentDescription = "Recording",
-                        modifier = Modifier.size(8.dp),
-                        tint = MaterialTheme.colorScheme.error
-                    )
-                    Text(
-                        text = "Recording...",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-            }
+            // Removed active message status indicator - no longer needed
             
             // Original Korean text
             Text(
-                text = if (message.originalText.isBlank() && isActiveMessage) "Listening..." else message.originalText,
+                text = message.originalText,
                 style = MaterialTheme.typography.bodyLarge,
                 fontWeight = FontWeight.Medium,
-                color = if (message.originalText.isBlank() && isActiveMessage) 
-                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                else MaterialTheme.colorScheme.onSurface
+                color = MaterialTheme.colorScheme.onSurface
             )
             
             Spacer(modifier = Modifier.height(8.dp))
@@ -134,18 +110,12 @@ fun MessageBubble(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.Top
                 ) {
-                    val displayText = if (translatedText.isBlank() && isActiveMessage) {
-                        "Translating..."
-                    } else {
-                        translatedText
-                    }
+                    val displayText = translatedText
                     
                     Text(
                         text = displayText,
                         style = MaterialTheme.typography.bodyMedium,
-                        color = if (translatedText.isBlank() && isActiveMessage) 
-                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.weight(1f)
                     )
                     

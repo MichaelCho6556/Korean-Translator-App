@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="false">
+        <!-- Allow secure connections to Google APIs -->
+        <domain includeSubdomains="true">googleapis.com</domain>
+        <domain includeSubdomains="true">google.com</domain>
+        <domain includeSubdomains="true">googleapi.com</domain>
+        <domain includeSubdomains="true">firebase.googleapis.com</domain>
+        <domain includeSubdomains="true">generativelanguage.googleapis.com</domain>
+        
+        <!-- Soniox Speech Recognition API -->
+        <domain includeSubdomains="true">soniox.com</domain>
+        <domain includeSubdomains="true">api.soniox.com</domain>
+    </domain-config>
+    
+    <!-- Production security: No debug overrides to prevent MITM attacks -->
+    <!-- Debug overrides completely removed for enhanced security -->
+    <!-- In debug builds, system certificates are still trusted by default -->
+</network-security-config>
