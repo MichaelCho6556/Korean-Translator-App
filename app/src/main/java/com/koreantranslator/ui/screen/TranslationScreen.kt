@@ -99,11 +99,11 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
         ) {
             items(uiState.messages) { message -> MessageBubble(message = message) }
 
-            // Show active message box - SIMPLIFIED: Show when there's accumulated or partial text
+            // Show active message box during recording or when there's text
             val hasText = uiState.accumulatedKoreanText.isNotBlank() || 
-                         uiState.currentPartialText?.isNotBlank() == true || 
-                         uiState.systemStatus != null
-            if (hasText) {
+                         uiState.currentPartialText?.isNotBlank() == true
+            val shouldShowActiveBox = hasText || uiState.isRecording || uiState.isAccumulatingMessage
+            if (shouldShowActiveBox) {
                 item(key = "active_message_box") {
                     // DISPLAY: Combined accumulated text + current partial text
                     val koreanText = buildString {
@@ -115,8 +115,7 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                             append(uiState.currentPartialText)
                         }
                     }
-                    val displayText = uiState.systemStatus ?: koreanText
-                    val isSystemStatus = uiState.systemStatus != null
+                    
                     Card(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                             colors =
@@ -128,70 +127,32 @@ fun TranslationScreen(viewModel: OptimizedTranslationViewModel = hiltViewModel()
                             border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
                     ) {
                         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                            Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                if (isSystemStatus) {
-                                    CircularProgressIndicator(
-                                            modifier = Modifier.size(16.dp),
-                                            strokeWidth = 2.dp
-                                    )
-                                    Text(
-                                            text = "System Status",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary
-                                    )
-                                } else {
-                                    // SIMPLIFIED: Stable status display based only on text presence
-                                    val (statusIcon, statusText, statusColor) = Triple(
-                                        Icons.Default.Mic, 
-                                        "Speaking...", 
-                                        MaterialTheme.colorScheme.primary
-                                    )
-                                    Icon(
-                                            statusIcon,
-                                            contentDescription = statusText,
-                                            modifier = Modifier.size(16.dp),
-                                            tint = statusColor
-                                    )
-                                    Text(
-                                            text = statusText,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = statusColor
-                                    )
-                                }
-                            }
-                            
-                            // STABILIZED: Display text content with fallback
-                            if (displayText?.isNotBlank() == true) {
-                                Spacer(modifier = Modifier.height(8.dp))
+                            // DISPLAY: Korean text content
+                            if (koreanText.isNotBlank()) {
                                 Text(
-                                        text = displayText,
+                                        text = koreanText,
                                         style = MaterialTheme.typography.bodyLarge,
                                         fontWeight = FontWeight.Medium
                                 )
                             }
                             
-                            // Show accumulated English translation + current partial translation
-                            if (!isSystemStatus) {
-                                val englishText = buildString {
-                                    if (uiState.accumulatedEnglishText.isNotBlank()) {
-                                        append(uiState.accumulatedEnglishText)
-                                    }
-                                    if (uiState.currentPartialTranslation?.isNotBlank() == true) {
-                                        if (uiState.accumulatedEnglishText.isNotBlank()) append(" ")
-                                        append(uiState.currentPartialTranslation)
-                                    }
+                            // DISPLAY: English translation
+                            val englishText = buildString {
+                                if (uiState.accumulatedEnglishText.isNotBlank()) {
+                                    append(uiState.accumulatedEnglishText)
                                 }
-                                if (englishText.isNotBlank()) {
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                            text = englishText,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                                if (uiState.currentPartialTranslation?.isNotBlank() == true) {
+                                    if (uiState.accumulatedEnglishText.isNotBlank()) append(" ")
+                                    append(uiState.currentPartialTranslation)
                                 }
+                            }
+                            if (englishText.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                        text = englishText,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
                     }

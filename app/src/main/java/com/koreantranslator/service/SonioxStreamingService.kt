@@ -98,9 +98,6 @@ class SonioxStreamingService @Inject constructor(
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState
     
-    // System status for UI feedback (separate from speech content)
-    private val _systemStatus = MutableStateFlow<String?>(null)
-    val systemStatus: StateFlow<String?> = _systemStatus
     
     // Audio recording
     private var audioRecord: AudioRecord? = null
@@ -255,7 +252,6 @@ class SonioxStreamingService @Inject constructor(
         partialTextClearJob?.cancel() // Cancel any pending delayed clear
         _partialText.value = null  
         // REMOVED: _accumulatedText.value = null
-        _systemStatus.value = "Connecting to Soniox..."  // Use system status instead
         lastPartialText = ""  // Reset debouncing state
         _connectionState.value = ConnectionState.CONNECTING
         
@@ -409,7 +405,6 @@ class SonioxStreamingService @Inject constructor(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "✓ WebSocket connected to Soniox")
                 _connectionState.value = ConnectionState.CONNECTED
-                _systemStatus.value = null  // Clear system status when connected
                 
                 // Send authentication and configuration (Soniox API v2)
                 // DYNAMIC CONFIGURATION: Uses learned phrases from SmartPhraseCache
@@ -433,7 +428,6 @@ class SonioxStreamingService @Inject constructor(
                 
                 // Soniox doesn't send an 'authenticated' response, it starts streaming immediately
                 _connectionState.value = ConnectionState.AUTHENTICATED
-                _systemStatus.value = null  // Clear system status when authenticated
                 
                 // Stop buffering and send buffered audio immediately
                 isBuffering = false
